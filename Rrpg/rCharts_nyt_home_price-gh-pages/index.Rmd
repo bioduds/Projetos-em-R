@@ -1,0 +1,144 @@
+---
+title: "rCharts NYT Interactive Home Price"
+author: "Timely Portfolio  (all credit to NYTimes)"
+github:
+  user: timelyportfolio
+  repo: rCharts_nyt_home_price
+  branch: gh-pages
+framework: bootstrap
+mode: selfcontained
+widgets: nyt_home
+highlighter: prettify
+hitheme: twitter-bootstrap
+assets:
+  css:
+  - http://fonts.googleapis.com/css?family=Raleway:300
+  - http://fonts.googleapis.com/css?family=Oxygen
+---
+
+<style>
+body{
+  font-family: 'Oxygen', sans-serif;
+  font-size: 16px;
+  line-height: 24px;
+}
+
+h1,h2,h3,h4 {
+  font-family: 'Raleway', sans-serif;
+}
+
+.container { width: 1000px; }
+h3 {
+  background-color: #D4DAEC;
+  text-indent: 100px; 
+}
+h4 {
+  text-indent: 100px;
+}
+
+g-table-intro h4 {
+  text-indent: 0px;
+}
+</style>
+
+<a href="https://github.com/timelyportfolio/rCharts_nyt_home_price"><img style="position: absolute; top: 0; right: 0; border: 0;" src="https://s3.amazonaws.com/github/ribbons/forkme_right_darkblue_121621.png" alt="Fork me on GitHub"></a>
+
+# Great NYT Interactive -- Now Reusable with rCharts
+
+---
+<br/>
+### Disclaimer and Attribution
+
+**I claim absolutely no credit for this visualization, which I consider one of the most best I have ever seen.  All credit belongs to the <a href = "http://www.nytimes.com/interactive/2011/05/31/business/economy/case-shiller-index.html">original source</a>.  If anybody believes this to be not fair use, I will take it down immediately.  I am implicitly assuming approval for this fork due to the <a href = "http://datastori.es/data-stories-22-nyt-graphics-and-d3-with-mike-bostock-and-shan-carter/">data.stories interview</a>.** 
+
+```{r echo=F, warning= F, message=F}
+opts_chunk$set(message = FALSE, warning = FALSE, error = FALSE, tidy = FALSE, cache = FALSE,results = 'asis' )
+```
+
+---
+<br/>
+### Another Favorite from NYT
+  
+I think we all know the [data visualization team at NYT](http://blog.visual.ly/10-things-you-can-learn-from-the-new-york-times-data-visualizations/) is simply amazing.  Earlier this year in my post [d3 <- R with rCharts and slidify](http://timelyportfolio.blogspot.com/2013/04/d3-r-with-rcharts-and-slidify.html) I adapted and recreated the [512 Paths to the White House](http://www.nytimes.com/interactive/2012/11/02/us/politics/paths-to-the-white-house.html) to work with `R` data through [`rCharts`](http://rcharts.io/site).  Unfortunately, I was not creative enough to think of other data sets to plug into the visualization.  When Scott Murray tweeted, 
+
+<br/>
+<blockquote class="twitter-tweet"><p>Over at <a href="https://twitter.com/nytgraphics">@nytgraphics</a>, <a href="https://twitter.com/KevinQ">@KevinQ</a> and <a href="https://twitter.com/shancarter">@shancarter</a> really know how to wiggle a baseline. <a href="http://t.co/gS9gHrSLIu">http://t.co/gS9gHrSLIu</a></p>&mdash; Scott Murray (@alignedleft) <a href="https://twitter.com/alignedleft/statuses/349647895122804738">June 25, 2013</a></blockquote>
+<script async src="http://platform.twitter.com/widgets.js" charset="utf-8"></script>
+<br/>
+
+I immediately knew the [Case Shiller Home Price Index visualization](http://www.nytimes.com/interactive/2011/05/31/business/economy/case-shiller-index.html) would be perfect for reuse with any cumulative growth time series data.   This is a bit of a hack of `rCharts` and should not be considered best practices, but it is a demonstration of the very flexible design of the package.  In the spirit of this [discussion](http://datastori.es/data-stories-23-inspiration-or-plagiarism/), I did not want to just copy entirely.  I was able to add a couple key innovations to the visualization:
+
+- Generalize the d3 code a little more to adapt to the data
+- Build in `R` with `rCharts` to make it reusable.
+
+
+---
+<br/>
+### Reusable Version in rCharts
+As I mentioned above, this visualization works well with any cumulative growth time series, so let's apply it to the `managers` dataset supplied by the `PerformanceAnalytics` package.
+
+```{r echo = F, eval = F, results = 'asis'}
+#I include this in case you want to create the original
+p1 <- rCharts$new()
+p1$setLib('libraries/widgets/nyt_home')
+p1$setTemplate(script = "libraries/widgets/nyt_home/layouts/nyt_home.html")
+
+p1$set(description = "The Standard & Poor's Case-Shiller Home Price Index for 20 major metropolitan areas is one of the most closely watched gauges of the housing market. The figures for April were released June 25. Figures shown here are not seasonally adjusted or adjusted for inflation.")
+
+#get the data and convert to a format that we would expect from melted xts
+#will be typical
+#also original only uses a single value (val) and not other 
+data <- read.csv("data/case-shiller-tiered2.csv", stringsAsFactors = F)
+
+data.melt <- data.frame(
+  format(as.Date(paste(data[,3],data[,4],"01",sep="-"),format = "%Y-%m-%d")),
+  data[,c(1,2,5)]
+)
+colnames(data.melt) <- c("date",colnames(data.melt)[-1])
+
+
+p1$set(data = data.melt)
+p1$set(groups = "citycode")
+#cat(noquote(p1$html()))
+```
+
+<h4>Get Data and Transform</h4>
+```{r}
+#get the data and convert to a format that we would expect from melted xts
+#will be typical
+#also original only uses a single value (val) and not other 
+require(reshape2)
+require(PerformanceAnalytics)
+
+data(managers)
+managers <- na.omit(managers)
+managers.melt <- melt(
+  data.frame( index( managers ), coredata(cumprod( managers+1 )*100 ) ),
+  id.vars = 1
+)
+colnames(managers.melt) <- c("date", "manager","val")
+managers.melt[,"date"] <- format(managers.melt[,"date"],format = "%Y-%m-%d")
+```
+
+<h4>Draw The Graph</h4>
+```{r}
+require(rCharts)
+p2 <- rCharts$new()
+p2$setLib('libraries/widgets/nyt_home')
+p2$setTemplate(script = "libraries/widgets/nyt_home/layouts/nyt_home.html")
+
+p2$set(
+  description = "This data comes from the managers dataset included in the R package PerformanceAnalytics.",
+  data = managers.melt,
+  groups = "manager"
+)
+cat(noquote(p2$html()))
+```
+
+### Thanks
+As I hope you can tell, this post was more a function of the efforts of others than of my own.
+
+Thanks specifically:
+- Ramnath Vaidyanathan for [rCharts](http://rcharts.io/site) and [slidify](http://slidify.org).
+- NYT Visualization Design Team for all their inspiring examples.
+- Google fonts [Raleway](http://www.google.com/fonts/specimen/Raleway) and [Oxygen](http://www.google.com/fonts/specimen/Oxygen)

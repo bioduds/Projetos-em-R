@@ -1,0 +1,70 @@
+---
+title: "Lista de Exercícios 1 - Estatística Computacional e Otimização (ECO)"
+author: "Eduardo Capanema (2020041515)"
+date: "Janeiro de 2021"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Problema 1
+
+Faça um código em R para simular o preenchimento de um album de n figurinhas. Através de simulações para vários valores de n, descubra uma expressão aproximada para o número médio de figurinhas que são necessárias para completar o álbum.
+
+
+```{r figurinhas}
+
+S = 3000
+N = 100
+
+print( paste( "Simulacoes:", S ) )
+print( paste( "Tamanho do Album:", N ) )
+
+allDraws = c()
+
+for( i in 1:S ) {
+    #print( paste( "Simulação", i ) )
+    draws = 0
+    album = c()
+    while( length( album ) < N ) {
+        draws <- draws + 1
+        r1 <- sample( 1:N, 1 )
+        album <- append( album, r1 )
+        album <- unique( album );
+    }
+    allDraws <- append( allDraws, draws )
+}
+print( paste( "Numero de Compras de pacotes com uma figurinha:", round( mean( allDraws ) ) ) )
+print( paste( "Valor Esperado:", round( ( N * log( N ) ) ) ) )
+
+```
+
+## Problema 2
+
+Um sultão promove um concurso para arranjar uma princesa que se case com seu filho. A princesa será escolhida a partir do valor do dote de casamento. Uma lista é feita com n princesas, que se apresentam em sequência numa ordem pré-determinada, informando os valores de seus dotes. O valor de cada dote é mantido em segredo até o momento da apresentação. O sultão pode decidir aceitar a princesa da vez, ou então recusá-la, passando para a próxima princesa da lista, até que uma princesa seja escolhida ou que a lista chegue ao fim (e nesse caso aceitando a última princesa da lista). O sultão vai utilizar a seguinte estratégia. Escolha um inteiro p, 0<=p<n. Recuse as p primeiras princesas, e aceite a primeira princesa que tiver o maior dote até o momento. Calcule o número p que maximize a probabilidade de escolher a princesa com o maior dote de todas.
+
+
+```{r sultao}
+
+N = 100
+R = 3
+S = seq( 1, N )
+flag = 0
+P = sample( S, N, replace=FALSE )
+minR = min( P[1:R] )
+j = R + 1
+while( ( P[j] > minR ) && ( j < N ) ) {
+    j = j + 1
+}
+if( P[j] <= 1 ) flag = flag + 1
+print( paste( "Valor Esperado: ", round( ( N * log( N ) * 0.577 ) ) ) ) ## constante de euler
+
+```
+
+Nota: Github repositório do código: https://github.com/bioduds/EST171-ECO-UFMG (Versao com Shinny para graficos e visualizações em app)

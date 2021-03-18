@@ -1,0 +1,43 @@
+---
+title: "Exploring Statistical Models for Role Playing Games using R"
+author: "Eduardo Capanema"
+date: "December 30, 2020"
+output: html_document
+---
+
+
+## Introduction
+
+As an RPG (Role Playing Game) ex-player and data scientist, it occurred to me to try and perform statistical experiments, in order to learn possible methods that are more suited to be used in RPGs for predicting outcomes of actions and events. This attempt aims at producing more realistic procedures that could be used by players throughout the gameplay. 
+
+### Random Variables
+
+Frequently, ...
+
+## Binomial Distribution versus Simple Dice Rolling
+
+
+
+
+```{r}
+
+
+
+
+```
+
+
+## Correctly Updating Outcomes using Bayesian Inference
+
+
+
+
+
+## References
+
+* https://blog.revolutionanalytics.com/2017/11/role-playing-with-probabilities.html
+
+* http://pages.stat.wisc.edu/~larget/R/prob-R.pdf
+
+* Ross, Sheldon. PROBABILIDADE, Um curso moderno com aplicacoes
+

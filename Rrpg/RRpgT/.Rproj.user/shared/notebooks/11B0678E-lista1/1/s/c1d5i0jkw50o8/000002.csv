@@ -1,0 +1,5 @@
+"0","N = 100"
+"0","R = 3"
+"0","S = seq( 1, n )"
+"2","Fehler in seq.default(1, n) : Objekt 'n' nicht gefunden
+"

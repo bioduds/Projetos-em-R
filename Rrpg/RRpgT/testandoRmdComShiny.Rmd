@@ -1,0 +1,80 @@
+---
+title: "Testando Rmd com Shiny"
+author: "Eduardo Capanema"
+date: "9 1 2021"
+output: html_document
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+```{r, echo=FALSE, message=FALSE}
+
+library( shiny )
+library( shinyjs )
+
+# Define UI for application that draws a histogram
+ui <- fluidPage(
+    
+    # Application title
+    titlePanel( "CDF - Cumulative Distribution Function" ),
+    
+    # Sidebar with a slider input for number of bins 
+    sidebarLayout(
+        sidebarPanel(
+            sliderInput( "bins", "Number of bins:", min=1, max=50, value=30 )
+        ),
+        # Show a plot of the generated distribution
+        mainPanel( plotOutput( "distPlot" ) )
+    ),
+    actionButton( "actionBtn", "Text to display" ),
+    
+)
+
+# SERVER
+server <- function( input, output, session ) {
+    
+    output$distPlot <- renderPlot({
+        # generate bins based on input$bins from ui.R
+        x <- faithful[ , 2 ]
+        bins <- seq( min( x ), max( x ), length.out=input$bins + 1 )
+        # draw the histogram with the specified number of bins
+        hist( x, breaks=bins, col='darkgray', border='white' )
+    })
+    
+
+    actionBtnFn <- eventReactive( input$actionBtn, {
+        # do something
+        print( "LIIIIIFE IS GOOOOOOD" )
+        
+        
+    })    
+    
+}
+# Run the application 
+shinyApp( ui=ui, server=server )
+
+```
+
