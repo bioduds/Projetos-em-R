@@ -1,6 +1,8 @@
 ### Eduardo Capanema (bioduds@gmail.com)
 ### Projeto RRpg - Criando um RPG estatisticamente coerente
 
+install.packages("ggplot2")
+
 library( shiny )
 library( shinyjs )
 library( ggplot2 )
