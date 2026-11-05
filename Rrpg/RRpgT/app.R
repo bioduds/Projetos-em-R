@@ -1,6 +1,8 @@
 library(shiny)
 library(ggplot2)
 library(httr2)
+library(DBI)
+library(RSQLite)
 
 env_file <- file.path(getwd(), ".env")
 if (file.exists(env_file) && !readRenviron(env_file)) {
@@ -90,22 +92,393 @@ campaign_context_seed <- paste(
   sep = "\n"
 )
 
-campaign_memory_limit <- 8L
+ollama_base_url <- function() {
+  base_url <- trimws(Sys.getenv(
+    "OLLAMA_BASE_URL",
+    unset = "http://127.0.0.1:11434"
+  ))
+  sub("/+$", "", base_url)
+}
 
-format_campaign_context <- function(memory) {
+ollama_embedding_model <- function() {
+  trimws(Sys.getenv(
+    "OLLAMA_EMBEDDING_MODEL",
+    unset = "nomic-embed-text:latest"
+  ))
+}
+
+campaign_database_path <- function() {
+  configured_path <- trimws(Sys.getenv(
+    "RPG_VECTOR_DB_PATH",
+    unset = file.path("data", "campaign_memory.sqlite")
+  ))
+  if (!nzchar(configured_path)) {
+    stop("RPG_VECTOR_DB_PATH não pode ser vazio.", call. = FALSE)
+  }
+
+  if (!grepl("^(/|~)", configured_path)) {
+    configured_path <- file.path(getwd(), configured_path)
+  }
+  path.expand(configured_path)
+}
+
+open_campaign_store <- function() {
+  database_path <- campaign_database_path()
+  database_directory <- dirname(database_path)
+  if (!dir.exists(database_directory) &&
+      !dir.create(database_directory, recursive = TRUE)) {
+    stop("Não foi possível criar o diretório do banco da campanha.",
+         call. = FALSE)
+  }
+
+  connection <- DBI::dbConnect(RSQLite::SQLite(), dbname = database_path)
+  DBI::dbExecute(connection, "PRAGMA foreign_keys = ON")
+  DBI::dbExecute(connection, "PRAGMA busy_timeout = 5000")
+  DBI::dbExecute(connection, "
+    CREATE TABLE IF NOT EXISTS campaigns (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  ")
+  DBI::dbExecute(connection, "
+    CREATE TABLE IF NOT EXISTS campaign_memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      campaign_id TEXT NOT NULL REFERENCES campaigns(id),
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      metadata TEXT NOT NULL,
+      embedding TEXT,
+      embedding_model TEXT,
+      created_at TEXT NOT NULL
+    )
+  ")
+  DBI::dbExecute(connection, "
+    CREATE INDEX IF NOT EXISTS campaign_memories_campaign_time
+    ON campaign_memories(campaign_id, id)
+  ")
+  DBI::dbExecute(connection, "
+    CREATE UNIQUE INDEX IF NOT EXISTS campaign_memories_single_seed
+    ON campaign_memories(campaign_id) WHERE kind = 'seed'
+  ")
+  connection
+}
+
+campaign_embedding_vectors <- function(texts) {
+  model <- ollama_embedding_model()
+  if (!nzchar(model)) {
+    stop("OLLAMA_EMBEDDING_MODEL não pode ser vazio.", call. = FALSE)
+  }
+
+  response <- httr2::request(paste0(ollama_base_url(), "/api/embed")) |>
+    httr2::req_body_json(list(model = model, input = as.list(texts))) |>
+    httr2::req_timeout(120) |>
+    httr2::req_perform()
+  httr2::resp_check_status(response)
+  body <- httr2::resp_body_json(response, simplifyVector = FALSE)
+  embeddings <- body$embeddings
+  if (!is.list(embeddings) || length(embeddings) != length(texts)) {
+    stop("Ollama retornou uma quantidade inválida de vetores.",
+         call. = FALSE)
+  }
+
+  vectors <- lapply(embeddings, function(embedding) {
+    vector <- unlist(embedding, recursive = TRUE, use.names = FALSE)
+    if (!is.numeric(vector) || length(vector) == 0L ||
+        any(!is.finite(vector))) {
+      stop("Ollama retornou um vetor de embedding inválido.",
+           call. = FALSE)
+    }
+    vector
+  })
+  dimensions <- vapply(vectors, length, integer(1))
+  if (length(unique(dimensions)) != 1L) {
+    stop("Ollama retornou vetores com dimensões diferentes.",
+         call. = FALSE)
+  }
+  vectors
+}
+
+ensure_campaign_seed <- function(connection, campaign_id) {
+  now <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+  DBI::dbExecute(
+    connection,
+    paste(
+      "INSERT OR IGNORE INTO campaigns (id, title, created_at, updated_at)",
+      "VALUES (?, ?, ?, ?)"
+    ),
+    params = list(campaign_id, "Aventura de Pedra Clara", now, now)
+  )
+
+  seed_exists <- DBI::dbGetQuery(
+    connection,
+    "SELECT 1 FROM campaign_memories WHERE campaign_id = ? AND kind = 'seed' LIMIT 1",
+    params = list(campaign_id)
+  )
+  if (nrow(seed_exists) == 0L) {
+    DBI::dbExecute(
+      connection,
+      paste(
+        "INSERT OR IGNORE INTO campaign_memories",
+        "(campaign_id, kind, content, metadata, created_at)",
+        "VALUES (?, 'seed', ?, ?, ?)"
+      ),
+      params = list(
+        campaign_id,
+        campaign_context_seed,
+        as.character(jsonlite::toJSON(
+          list(narration = campaign_context_seed),
+          auto_unbox = TRUE
+        )),
+        now
+      )
+    )
+  }
+  invisible(NULL)
+}
+
+insert_campaign_memory <- function(
+  connection,
+  campaign_id,
+  kind,
+  content,
+  metadata
+) {
+  now <- format(Sys.time(), tz = "UTC", usetz = TRUE)
+  DBI::dbExecute(
+    connection,
+    paste(
+      "INSERT INTO campaign_memories",
+      "(campaign_id, kind, content, metadata, created_at)",
+      "VALUES (?, ?, ?, ?, ?)"
+    ),
+    params = list(
+      campaign_id,
+      kind,
+      content,
+      as.character(jsonlite::toJSON(
+        metadata,
+        auto_unbox = TRUE,
+        null = "null",
+        digits = NA
+      )),
+      now
+    )
+  )
+  as.integer(DBI::dbGetQuery(
+    connection,
+    "SELECT last_insert_rowid() AS id"
+  )$id[[1]])
+}
+
+update_campaign_memory <- function(
+  connection,
+  memory_id,
+  content,
+  metadata
+) {
+  DBI::dbExecute(
+    connection,
+    paste(
+      "UPDATE campaign_memories",
+      "SET content = ?, metadata = ?, embedding = NULL, embedding_model = NULL",
+      "WHERE id = ?"
+    ),
+    params = list(
+      content,
+      as.character(jsonlite::toJSON(
+        metadata,
+        auto_unbox = TRUE,
+        null = "null",
+        digits = NA
+      )),
+      memory_id
+    )
+  )
+  if (DBI::dbGetQuery(
+    connection,
+    "SELECT changes() AS changed"
+  )$changed[[1]] != 1L) {
+    stop("O registro da campanha não foi encontrado para atualização.",
+         call. = FALSE)
+  }
+  invisible(NULL)
+}
+
+index_pending_campaign_memories <- function(connection, campaign_id) {
+  model <- ollama_embedding_model()
+  pending <- DBI::dbGetQuery(
+    connection,
+    paste(
+      "SELECT id, content FROM campaign_memories",
+      "WHERE campaign_id = ?",
+      "AND (embedding IS NULL OR embedding_model != ?)",
+      "ORDER BY id"
+    ),
+    params = list(campaign_id, model)
+  )
+  if (nrow(pending) == 0L) {
+    return(invisible(NULL))
+  }
+
+  vectors <- campaign_embedding_vectors(pending$content)
+  DBI::dbWithTransaction(connection, {
+    for (index in seq_len(nrow(pending))) {
+      DBI::dbExecute(
+        connection,
+        paste(
+          "UPDATE campaign_memories",
+          "SET embedding = ?, embedding_model = ?",
+          "WHERE id = ?"
+        ),
+        params = list(
+          as.character(jsonlite::toJSON(
+            as.list(vectors[[index]]),
+            auto_unbox = FALSE,
+            digits = NA
+          )),
+          model,
+          pending$id[[index]]
+        )
+      )
+    }
+  })
+  invisible(NULL)
+}
+
+decode_campaign_embedding <- function(encoded) {
+  vector <- unlist(
+    jsonlite::fromJSON(encoded, simplifyVector = TRUE),
+    use.names = FALSE
+  )
+  if (!is.numeric(vector) || length(vector) == 0L ||
+      any(!is.finite(vector))) {
+    stop("O banco contém um vetor de embedding inválido.", call. = FALSE)
+  }
+  vector
+}
+
+retrieve_campaign_context <- function(
+  connection,
+  campaign_id,
+  query,
+  relevant_limit = 5L,
+  recent_limit = 5L
+) {
+  ensure_campaign_seed(connection, campaign_id)
+  index_pending_campaign_memories(connection, campaign_id)
+  query_vector <- campaign_embedding_vectors(query)[[1]]
+  memories <- DBI::dbGetQuery(
+    connection,
+    paste(
+      "SELECT id, kind, content, embedding, embedding_model",
+      "FROM campaign_memories WHERE campaign_id = ? ORDER BY id"
+    ),
+    params = list(campaign_id)
+  )
+  seed <- memories[memories$kind == "seed", , drop = FALSE]
+  candidates <- memories[memories$kind != "seed", , drop = FALSE]
+  if (nrow(seed) != 1L || anyNA(memories$embedding)) {
+    stop("A memória da campanha ainda não está completamente indexada.",
+         call. = FALSE)
+  }
+
+  selected <- candidates[FALSE, , drop = FALSE]
+  if (nrow(candidates) > 0L) {
+    candidate_vectors <- lapply(candidates$embedding, decode_campaign_embedding)
+    query_norm <- sqrt(sum(query_vector^2))
+    if (!is.finite(query_norm) || query_norm == 0) {
+      stop("O vetor da consulta não pode ter norma zero.", call. = FALSE)
+    }
+    similarity <- vapply(candidate_vectors, function(vector) {
+      if (length(vector) != length(query_vector)) {
+        stop(
+          "A dimensão de um vetor salvo não corresponde ao modelo de embedding atual.",
+          call. = FALSE
+        )
+      }
+      vector_norm <- sqrt(sum(vector^2))
+      if (vector_norm == 0) 0 else {
+        sum(vector * query_vector) / (vector_norm * query_norm)
+      }
+    }, numeric(1))
+
+    relevant_indices <- head(
+      order(similarity, decreasing = TRUE),
+      min(as.integer(relevant_limit), length(similarity))
+    )
+    recent_indices <- tail(
+      seq_len(nrow(candidates)),
+      min(as.integer(recent_limit), nrow(candidates))
+    )
+    selected_indices <- sort(unique(c(relevant_indices, recent_indices)))
+    selected <- candidates[selected_indices, , drop = FALSE]
+  }
+
+  selected_lines <- if (nrow(selected) == 0L) {
+    character()
+  } else {
+    paste0(
+      "[", selected$kind, " #", selected$id, "]\n",
+      selected$content
+    )
+  }
   paste(
-    c(campaign_context_seed, unlist(memory, use.names = FALSE)),
-    collapse = "\n\n"
+    c(
+      "CONTEXTO-BASE DA CAMPANHA:",
+      seed$content[[1]],
+      if (length(selected_lines) > 0L) {
+        c("", "MEMÓRIAS RECUPERADAS — fatos relevantes e acontecimentos recentes:",
+          selected_lines)
+      }
+    ),
+    collapse = "\n"
   )
 }
 
-append_campaign_memory <- function(memory, event, narration_text) {
-  entry <- paste(
-    paste("Ação:", trimws(event)),
-    paste("O que aconteceu:", trimws(narration_text)),
-    sep = "\n"
+campaign_memory_archive <- function(connection, campaign_id) {
+  DBI::dbGetQuery(
+    connection,
+    paste(
+      "SELECT id, kind, content, metadata",
+      "FROM campaign_memories WHERE campaign_id = ? ORDER BY id"
+    ),
+    params = list(campaign_id)
   )
-  utils::tail(c(memory, list(entry)), campaign_memory_limit)
+}
+
+campaign_narrations <- function(connection, campaign_id) {
+  memories <- DBI::dbGetQuery(
+    connection,
+    paste(
+      "SELECT metadata FROM campaign_memories",
+      "WHERE campaign_id = ? AND kind IN ('action', 'narrative')",
+      "ORDER BY id"
+    ),
+    params = list(campaign_id)
+  )
+  narrations <- lapply(memories$metadata, function(encoded) {
+    jsonlite::fromJSON(encoded, simplifyVector = FALSE)$narration
+  })
+  Filter(
+    function(text) is.character(text) && length(text) == 1L &&
+      !is.na(text) && nzchar(trimws(text)),
+    narrations
+  )
+}
+
+campaign_memory_summary <- function(connection, campaign_id) {
+  DBI::dbGetQuery(
+    connection,
+    paste(
+      "SELECT COUNT(*) AS total,",
+      "SUM(CASE WHEN embedding IS NOT NULL AND embedding_model = ?",
+      "THEN 1 ELSE 0 END) AS indexed",
+      "FROM campaign_memories WHERE campaign_id = ?"
+    ),
+    params = list(ollama_embedding_model(), campaign_id)
+  )
 }
 
 format_jev_state <- function(event_description, campaign_context) {
@@ -386,6 +759,51 @@ action_narration_facts <- function(result) {
   )
 }
 
+action_campaign_memory <- function(result, narration_text = NULL) {
+  content <- paste(
+    paste("Ação tentada:", result$event),
+    paste(
+      "Desfecho estabelecido:",
+      if (result$success) {
+        "o objetivo foi alcançado."
+      } else {
+        "o objetivo não foi alcançado."
+      }
+    ),
+    if (!is.null(narration_text)) {
+      paste("Narração da cena:", trimws(narration_text))
+    },
+    sep = "\n"
+  )
+  metadata <- list(
+    event = result$event,
+    difficulty = result$difficulty,
+    variance = result$variance,
+    mu = result$mu,
+    sigma = result$sigma,
+    roll = result$roll,
+    percentile = result$percentile,
+    is_typical = result$is_typical,
+    expected_roll = result$expected_roll,
+    roll_delta = result$roll_delta,
+    expected_sigma_delta = result$expected_sigma_delta,
+    sigma_score = result$sigma_score,
+    sigma_band_index = result$sigma_band_index,
+    sigma_band = result$sigma_band,
+    sigma_adjective = result$sigma_adjective,
+    success_threshold = result$success_threshold,
+    success_threshold_index = result$success_threshold_index,
+    success = result$success,
+    outcome = result$outcome,
+    jev_classification = result$jev_classification,
+    context_used = result$campaign_context
+  )
+  if (!is.null(narration_text)) {
+    metadata$narration <- trimws(narration_text)
+  }
+  list(content = content, metadata = metadata)
+}
+
 stream_ollama_response <- function(
   system_prompt,
   user_prompt,
@@ -396,7 +814,7 @@ stream_ollama_response <- function(
   is_cancelled,
   empty_response_message = "Ollama retornou uma resposta vazia ou em formato inválido."
 ) {
-  request <- httr2::request("http://127.0.0.1:11434/api/chat") |>
+  request <- httr2::request(paste0(ollama_base_url(), "/api/chat")) |>
     httr2::req_body_json(list(
       model = "gemma4:latest",
       messages = list(
@@ -642,7 +1060,8 @@ ui <- fluidPage(
       div(
         style = "display:flex;align-items:center;gap:10px;",
         h4("Narração", style = "margin:0;"),
-        actionButton("generateNarrative", "Gerar Narrativa")
+        actionButton("generateNarrative", "Gerar Narrativa"),
+        uiOutput("narrativeStatus", inline = TRUE)
       ),
       br(),
       uiOutput("narration"),
@@ -653,17 +1072,115 @@ ui <- fluidPage(
 )
 
 server <- function(input, output, session) {
+  campaign_id <- trimws(Sys.getenv("RPG_CAMPAIGN_ID", unset = "pedra-clara"))
+  if (!nzchar(campaign_id)) {
+    stop("RPG_CAMPAIGN_ID não pode ser vazio.", call. = FALSE)
+  }
+  campaign_store <- open_campaign_store()
+  ensure_campaign_seed(campaign_store, campaign_id)
+
   jev_result <- reactiveVal(NULL)
   action_result <- reactiveVal(NULL)
   narration <- reactiveVal(NULL)
-  status_message <- reactiveVal("Descreva o evento e peça uma análise ao Jev.")
+  status_message <- reactiveVal(paste(
+    "Memória persistente pronta para a campanha",
+    shQuote(campaign_id),
+    "— descreva um evento e peça uma análise ao Jev."
+  ))
   generation_running <- reactiveVal(FALSE)
   generation_id <- reactiveVal(0L)
   active_generation <- reactiveVal(NULL)
   active_cancel <- reactiveVal(NULL)
-  campaign_memory <- reactiveVal(list())
-  campaign_narrative <- reactiveVal(character())
   campaign_story_stream <- reactiveVal(NULL)
+  narrative_status <- reactiveVal(NULL)
+  campaign_context_snapshot <- reactiveVal(paste(
+    "CONTEXTO-BASE DA CAMPANHA:",
+    campaign_context_seed,
+    sep = "\n"
+  ))
+  campaign_revision <- reactiveVal(0L)
+
+  persist_campaign_memory <- function(
+    kind,
+    content,
+    metadata,
+    memory_id = NULL
+  ) {
+    if (is.null(memory_id)) {
+      memory_id <- tryCatch(
+        insert_campaign_memory(
+          campaign_store,
+          campaign_id,
+          kind,
+          content,
+          metadata
+        ),
+        error = function(error) {
+          list(
+            id = NULL,
+            persisted = FALSE,
+            error = conditionMessage(error)
+          )
+        }
+      )
+      if (is.list(memory_id)) {
+        return(memory_id)
+      }
+    } else {
+      update_error <- tryCatch({
+        update_campaign_memory(
+          campaign_store,
+          memory_id,
+          content,
+          metadata
+        )
+        NULL
+      }, error = function(error) conditionMessage(error))
+      if (!is.null(update_error)) {
+        return(list(
+          id = memory_id,
+          persisted = TRUE,
+          error = update_error
+        ))
+      }
+    }
+
+    campaign_revision(shiny::isolate(campaign_revision()) + 1L)
+    indexing_error <- tryCatch({
+      index_pending_campaign_memories(campaign_store, campaign_id)
+      NULL
+    }, error = function(error) conditionMessage(error))
+    list(
+      id = memory_id,
+      persisted = TRUE,
+      indexing_error = indexing_error
+    )
+  }
+
+  memory_status <- function(result, success_message) {
+    if (!isTRUE(result$persisted)) {
+      return(paste(
+        success_message,
+        "O banco não conseguiu salvar este registro:",
+        result$error
+      ))
+    }
+    if (!is.null(result$error)) {
+      return(paste(
+        success_message,
+        "O registro anterior continua salvo, mas não foi possível atualizá-lo:",
+        result$error
+      ))
+    }
+    if (!is.null(result$indexing_error)) {
+      return(paste(
+        success_message,
+        "O registro foi salvo, mas a indexação vetorial falhou; será tentada novamente na próxima interação:",
+        result$indexing_error
+      ))
+    }
+    success_message
+  }
 
   set_generation_running <- function(running) {
     generation_running(running)
@@ -682,6 +1199,7 @@ server <- function(input, output, session) {
     active_generation(NULL)
     active_cancel(NULL)
     set_generation_running(FALSE)
+    narrative_status(NULL)
     if (is.function(cancel)) {
       cancel()
     }
@@ -764,7 +1282,26 @@ server <- function(input, output, session) {
 
   observeEvent(input$generateNarrative, {
     cancel_active_generation(message = NULL, flush = FALSE)
-    context_snapshot <- format_campaign_context(campaign_memory())
+    narrative_status("Gerando continuação da aventura...")
+    context_snapshot <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        "Continue a cena atual da aventura sem recomeçar a história."
+      ),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível recuperar a memória vetorial da campanha:",
+          conditionMessage(error)
+        ))
+        narrative_status("Falha ao recuperar a memória da campanha.")
+        NULL
+      }
+    )
+    if (is.null(context_snapshot)) {
+      return()
+    }
+    campaign_context_snapshot(context_snapshot)
     prompts <- campaign_narration_prompts(context_snapshot)
     campaign_story_stream("")
     status_message("Gerando continuação da aventura...")
@@ -785,19 +1322,22 @@ server <- function(input, output, session) {
         ))
       },
       on_complete = function(response_text) {
-        campaign_memory(append_campaign_memory(
-          shiny::isolate(campaign_memory()),
-          "Continuação da narrativa",
-          response_text
-        ))
-        campaign_narrative(utils::tail(
-          c(shiny::isolate(campaign_narrative()), response_text),
-          campaign_memory_limit
-        ))
+        narration(response_text)
+        persisted <- persist_campaign_memory(
+          "narrative",
+          paste("Continuação da aventura:", trimws(response_text)),
+          list(
+            narration = trimws(response_text),
+            context_used = context_snapshot
+          )
+        )
         campaign_story_stream(NULL)
-        status_message("Narrativa atualizada.")
+        message <- memory_status(persisted, "Narrativa atualizada.")
+        narrative_status(message)
+        status_message(message)
       },
       on_error = function(message) {
+        narrative_status(paste("Falha ao gerar narrativa:", message))
         status_message(paste("Não foi possível gerar a narrativa:", message))
       }
     )
@@ -805,8 +1345,26 @@ server <- function(input, output, session) {
 
   observeEvent(input$simulateCharacterAction, {
     cancel_active_generation(message = NULL, flush = FALSE)
+    context_snapshot <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        "Sugira uma ação possível para um personagem neste momento da aventura."
+      ),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível recuperar a memória vetorial da campanha:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(context_snapshot)) {
+      return()
+    }
+    campaign_context_snapshot(context_snapshot)
     prompts <- character_action_prompts(
-      format_campaign_context(campaign_memory())
+      context_snapshot
     )
     status_message("Criando uma sugestão de ação para um personagem...")
 
@@ -857,7 +1415,24 @@ server <- function(input, output, session) {
     }
 
     status_message("Consultando o Jev...")
-    context_snapshot <- format_campaign_context(campaign_memory())
+    context_snapshot <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        paste("AÇÃO ATUAL:", event)
+      ),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível recuperar a memória vetorial da campanha:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(context_snapshot)) {
+      return()
+    }
+    campaign_context_snapshot(context_snapshot)
     result <- tryCatch(
       classify_event_with_jev(event, context_snapshot),
       error = function(error) {
@@ -929,12 +1504,32 @@ server <- function(input, output, session) {
       return()
     }
 
+    context_snapshot <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        paste("AÇÃO ATUAL:", analysis$event)
+      ),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível recuperar a memória vetorial da campanha:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(context_snapshot)) {
+      return()
+    }
+    campaign_context_snapshot(context_snapshot)
+
     action <- sample_action(mu, sigma)
     result <- list(
       event = analysis$event,
       difficulty = unname(difficulty_labels[[input$selectDifficulty]]),
       variance = unname(variance_labels[[input$selectVariance]]),
-      campaign_context = analysis$campaign_context,
+      campaign_context = context_snapshot,
+      jev_classification = analysis$classification,
       mu = mu,
       sigma = sigma,
       roll = action$roll,
@@ -955,7 +1550,25 @@ server <- function(input, output, session) {
     action_result(result)
     narration(NULL)
     campaign_story_stream("")
-    status_message("Rolagem exibida no gráfico. Gerando a narração local...")
+    memory_entry <- action_campaign_memory(result)
+    persisted <- persist_campaign_memory(
+      "action",
+      memory_entry$content,
+      memory_entry$metadata
+    )
+    if (!isTRUE(persisted$persisted)) {
+      status_message(memory_status(
+        persisted,
+        "A rolagem foi calculada, mas a narração não será iniciada."
+      ))
+      return()
+    }
+    result$memory_id <- persisted$id
+    result$memory_indexing_error <- persisted$indexing_error
+    status_message(memory_status(
+      persisted,
+      "Rolagem exibida no gráfico. Gerando a narração local..."
+    ))
     start_streaming_generation(
       start_stream = function(...) {
         narrate_action_with_ollama(
@@ -971,35 +1584,45 @@ server <- function(input, output, session) {
         ))
       },
       on_complete = function(response_text) {
-        campaign_memory(append_campaign_memory(
-          shiny::isolate(campaign_memory()),
-          result$event,
-          response_text
-        ))
-        campaign_narrative(utils::tail(
-          c(shiny::isolate(campaign_narrative()), response_text),
-          campaign_memory_limit
-        ))
+        memory_entry <- action_campaign_memory(result, response_text)
+        persisted <- persist_campaign_memory(
+          "action",
+          memory_entry$content,
+          memory_entry$metadata,
+          memory_id = result$memory_id
+        )
         campaign_story_stream(NULL)
-        status_message("Ação e narração concluídas.")
+        status_message(memory_status(persisted, "Ação e narração concluídas."))
       },
       on_error = function(message) {
-        status_message(paste(
+        status_message(memory_status(persisted, paste(
           "A ação foi calculada, mas a narração falhou:",
           message
-        ))
+        )))
       }
     )
   })
 
   session$onSessionEnded(function() {
     cancel_active_generation(message = NULL, flush = FALSE)
+    if (DBI::dbIsValid(campaign_store)) {
+      DBI::dbDisconnect(campaign_store)
+    }
   })
 
   output$statusText <- renderUI(tags$p(status_message()))
 
+  output$narrativeStatus <- renderUI({
+    message <- narrative_status()
+    if (is.null(message) || !nzchar(message)) {
+      return(NULL)
+    }
+    tags$span(message, style = "margin-left:4px;")
+  })
+
   output$campaignStory <- renderUI({
-    completed_narration <- campaign_narrative()
+    campaign_revision()
+    completed_narration <- campaign_narrations(campaign_store, campaign_id)
     current_narration <- campaign_story_stream()
     show_current <- !is.null(current_narration) &&
       nzchar(current_narration) &&
@@ -1021,10 +1644,36 @@ server <- function(input, output, session) {
   })
 
   output$campaignContext <- renderUI({
+    campaign_revision()
+    summary <- campaign_memory_summary(campaign_store, campaign_id)
+    memories <- campaign_memory_archive(campaign_store, campaign_id)
+    archive <- vapply(seq_len(nrow(memories)), function(index) {
+      paste(
+        sprintf("[%s #%d]", memories$kind[[index]], memories$id[[index]]),
+        memories$content[[index]],
+        "Metadados:",
+        jsonlite::prettify(memories$metadata[[index]]),
+        sep = "\n"
+      )
+    }, character(1))
     tags$details(
       tags$summary("Contexto da aventura"),
+      tags$p(sprintf(
+        "Campanha: %s | Registros persistidos: %d | Vetores indexados: %d de %d | Modelo: %s",
+        campaign_id,
+        summary$total[[1]],
+        summary$indexed[[1]],
+        summary$total[[1]],
+        ollama_embedding_model()
+      )),
+      h4("Contexto recuperado para a interação mais recente"),
       tags$pre(
-        format_campaign_context(campaign_memory()),
+        campaign_context_snapshot(),
+        style = "white-space:pre-wrap;"
+      ),
+      h4("Arquivo completo da campanha"),
+      tags$pre(
+        paste(archive, collapse = "\n\n"),
         style = "white-space:pre-wrap;"
       )
     )
