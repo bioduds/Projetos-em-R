@@ -9,21 +9,31 @@ if (file.exists(env_file) && !readRenviron(env_file)) {
 
 difficulty_labels <- c(
   impossible = "Impossível",
+  nearly_impossible = "Quase impossível",
+  extremely_hard = "Extremamente difícil",
   very_hard = "Muito difícil",
   hard = "Difícil",
+  challenging = "Desafiador",
   medium = "Médio",
+  moderately_easy = "Moderadamente fácil",
   easy = "Fácil",
   very_easy = "Muito fácil",
+  almost_trivial = "Quase trivial",
   trivial = "Trivial"
 )
 
 difficulty_mu <- c(
   impossible = 97,
+  nearly_impossible = 93,
+  extremely_hard = 89,
   very_hard = 85,
   hard = 70,
+  challenging = 60,
   medium = 50,
+  moderately_easy = 40,
   easy = 30,
   very_easy = 15,
+  almost_trivial = 8,
   trivial = 3
 )
 
@@ -43,14 +53,54 @@ variance_sigma <- c(
   predictable = 1
 )
 
-success_threshold_for_difficulty <- function(difficulty_score) {
-  if (length(difficulty_score) != 1L || !is.numeric(difficulty_score) ||
-      !is.finite(difficulty_score) || difficulty_score < 0 ||
-      difficulty_score > 100) {
-    stop("A dificuldade deve ser um valor entre 0 e 100.", call. = FALSE)
+sigma_band_labels <- c(
+  "< -5σ | < 0,00003%",
+  "-5 a -4σ | 0,00003–0,00317%",
+  "-4 a -3σ | 0,00317–0,13499%",
+  "-3 a -2σ | 0,13499–2,27501%",
+  "-2 a -1σ | 2,27501–15,8655%",
+  "-1 a 0σ | 15,8655–50%",
+  "0 a +1σ | 50–84,1345%",
+  "+1 a +2σ | 84,1345–97,725%",
+  "+2 a +3σ | 97,725–99,865%",
+  "+3 a +4σ | 99,865–99,9968%",
+  "+4 a +5σ | 99,9968–99,99997%",
+  "> +5σ | > 99,99997%"
+)
+
+sigma_adjectives <- c(
+  "Inimaginável",
+  "Inacreditável",
+  "Raríssimo",
+  "Escasso",
+  "Incomum",
+  "Corriqueiro",
+  "Habitual",
+  "Atípico",
+  "Excecional",
+  "Extraordinário",
+  "Fenomenal",
+  "Inconcebível"
+)
+
+sigma_adjective_for_score <- function(sigma_score) {
+  if (length(sigma_score) != 1L || !is.numeric(sigma_score) ||
+      !is.finite(sigma_score)) {
+    stop("O desvio padronizado deve ser um valor finito.", call. = FALSE)
   }
 
-  0.06 + 0.84 * difficulty_score / 100
+  band_index <- findInterval(sigma_score, -5:5) + 1L
+  sigma_adjectives[[band_index]]
+}
+
+sigma_band_for_score <- function(sigma_score) {
+  if (length(sigma_score) != 1L || !is.numeric(sigma_score) ||
+      !is.finite(sigma_score)) {
+    stop("O desvio padronizado deve ser um valor finito.", call. = FALSE)
+  }
+
+  band_index <- findInterval(sigma_score, -5:5) + 1L
+  sigma_band_labels[[band_index]]
 }
 
 truncated_normal_bounds <- function(mu, sigma) {
@@ -94,24 +144,6 @@ d100_roll_for_percentile <- function(percentile, mu, sigma) {
   pmin(pmax(roll, 0), 100)
 }
 
-classify_action_outcome <- function(percentile, difficulty_score) {
-  if (length(percentile) != 1L || !is.numeric(percentile) ||
-      !is.finite(percentile) || percentile < 0 || percentile > 1) {
-    stop("O percentil deve ser um único valor entre 0 e 1.", call. = FALSE)
-  }
-
-  success_threshold <- success_threshold_for_difficulty(difficulty_score)
-  if (percentile < 0.05) {
-    "Crítico"
-  } else if (percentile > 0.95) {
-    "Extremo"
-  } else if (percentile >= success_threshold) {
-    "Sucesso"
-  } else {
-    "Falha"
-  }
-}
-
 sample_action <- function(mu, sigma) {
   if (length(mu) != 1L || !is.numeric(mu) || !is.finite(mu) ||
       mu < 0 || mu > 100 ||
@@ -123,13 +155,17 @@ sample_action <- function(mu, sigma) {
 
   percentile <- stats::runif(1)
   roll <- d100_roll_for_percentile(percentile, mu, sigma)
-  success_threshold <- success_threshold_for_difficulty(mu)
+  sigma_score <- (roll - mu) / sigma
 
   list(
     roll = roll,
     percentile = percentile,
-    success_threshold = success_threshold,
-    outcome = classify_action_outcome(percentile, mu)
+    expected_roll = mu,
+    roll_delta = roll - mu,
+    sigma_score = sigma_score,
+    normal_percentile = stats::pnorm(sigma_score),
+    sigma_band = sigma_band_for_score(sigma_score),
+    sigma_adjective = sigma_adjective_for_score(sigma_score)
   )
 }
 
@@ -173,20 +209,40 @@ classify_event_with_jev <- function(event_description) {
   }
 
   difficulty_criteria <- list(
-    impossible = "Quase impossível; dificuldade-base 97.",
-    very_hard = "Muito difícil; dificuldade-base 85.",
-    hard = "Difícil; dificuldade-base 70.",
-    medium = "Desafio mediano; dificuldade-base 50.",
-    easy = "Fácil; dificuldade-base 30.",
-    very_easy = "Muito fácil; dificuldade-base 15.",
-    trivial = "Trivial; dificuldade-base 3."
+    impossible = "Impossível; dificuldade-base 97. Só seria alcançável por uma mudança radical nas condições.",
+    nearly_impossible = "Quase impossível; dificuldade-base 93. Exige circunstâncias extraordinárias e uma execução excepcional.",
+    extremely_hard = "Extremamente difícil; dificuldade-base 89. Exige preparo excepcional e superar grandes obstáculos.",
+    very_hard = "Muito difícil; dificuldade-base 85. Exige habilidade elevada e superar obstáculos importantes.",
+    hard = "Difícil; dificuldade-base 70. Exige esforço, competência ou estratégia consideráveis.",
+    challenging = "Desafiador; dificuldade-base 60. Exige atenção e habilidade, com obstáculos relevantes, mas manejáveis.",
+    medium = "Médio; dificuldade-base 50. Um desafio equilibrado, compatível com a capacidade usual do personagem.",
+    moderately_easy = "Moderadamente fácil; dificuldade-base 40. A capacidade do personagem tende a superar o desafio.",
+    easy = "Fácil; dificuldade-base 30. Pouco esforço ou habilidade específica são necessários.",
+    very_easy = "Muito fácil; dificuldade-base 15. Quase não há obstáculos relevantes para o personagem.",
+    almost_trivial = "Quase trivial; dificuldade-base 8. A ação é simples e requer atenção mínima.",
+    trivial = "Trivial; dificuldade-base 3. A ação é praticamente imediata para o personagem."
   )
   variance_criteria <- list(
-    chaotic = "Resultado muito imprevisível; desvio padrão-base 20.",
-    erratic = "Resultado bastante imprevisível; desvio padrão-base 15.",
-    medium = "Variabilidade moderada; desvio padrão-base 10.",
-    expected = "Resultado relativamente previsível; desvio padrão-base 5.",
-    predictable = "Resultado muito previsível; desvio padrão-base 1."
+    chaotic = paste(
+      "Muito alta imprevisibilidade; desvio padrão-base 20.",
+      "As circunstâncias mudam sem padrão e podem levar a resultados muito diferentes."
+    ),
+    erratic = paste(
+      "Alta imprevisibilidade; desvio padrão-base 15.",
+      "Há fatores instáveis que podem alterar bastante o resultado, mas alguns limites são conhecidos."
+    ),
+    medium = paste(
+      "Imprevisibilidade moderada; desvio padrão-base 10.",
+      "O resultado é parcialmente previsível, com algumas circunstâncias capazes de desviá-lo."
+    ),
+    expected = paste(
+      "Baixa imprevisibilidade; desvio padrão-base 5.",
+      "O resultado provável é conhecido e poucas variações pequenas são esperadas."
+    ),
+    predictable = paste(
+      "Imprevisibilidade mínima; desvio padrão-base 1.",
+      "O resultado é praticamente determinado pelas condições conhecidas e varia muito pouco."
+    )
   )
 
   request_body <- list(
@@ -204,8 +260,12 @@ classify_event_with_jev <- function(event_description) {
       variance = list(
         type = "choice",
         instructions = paste(
-          "Classifique a variabilidade plausível dos resultados desta ação.",
-          "Considere o quanto fatores e circunstâncias tornam o resultado imprevisível."
+          "Classifique exclusivamente a imprevisibilidade do resultado desta ação, não a dificuldade de realizá-la.",
+          "Pergunte: mantendo a ação e a competência do personagem, quão incerto é o resultado por causa de acaso, fatores ocultos ou circunstâncias instáveis?",
+          "Se o resultado pode ser previsto com segurança e deve variar pouco, escolha baixa variância (Esperada ou Previsível).",
+          "Se vários fatores instáveis podem mudar o resultado de forma significativa, escolha alta variância (Errática ou Caótica).",
+          "Uma tarefa difícil pode ter baixa variância quando o resultado é previsível; uma tarefa fácil pode ter alta variância quando há muito acaso.",
+          "Não use a chance de sucesso, a complexidade ou o esforço como substitutos da imprevisibilidade."
         ),
         criteria = variance_criteria
       )
@@ -241,22 +301,26 @@ classify_event_with_jev <- function(event_description) {
   )
 }
 
-narrate_action_with_ollama <- function(result) {
-  user_message <- paste(
-    "Descreva em português brasileiro, em um parágrafo curto, o que ocorreu nesta ação.",
-    "Use o evento e o resultado mecânico abaixo como fatos.",
-    "Não altere a classificação nem invente regras ou consequências não sustentadas pelo contexto.",
+action_narration_facts <- function(result) {
+  paste(
+    "Fatos da ação:",
     "",
     paste("Evento:", result$event),
     paste("Dificuldade:", result$difficulty),
-    paste("Percentil mínimo para sucesso normal:", format(round(result$success_threshold * 100, 2), nsmall = 2), "%"),
+    paste("Rolagem esperada (μ):", format(round(result$expected_roll, 2), nsmall = 2)),
     paste("Variância:", result$variance),
+    paste("Desvio padrão da variância (σ):", format(round(result$sigma, 2), nsmall = 2)),
     paste("Valor rolado:", format(round(result$roll, 2), nsmall = 2)),
-    paste("Percentil:", format(round(result$percentile * 100, 2), nsmall = 2), "%"),
-    paste("Resultado:", result$outcome),
+    paste("Diferença em relação ao esperado:", format(round(result$roll_delta, 2), nsmall = 2)),
+    paste("Percentil acumulado do modelo d100:", format(round(result$percentile * 100, 2), nsmall = 2), "%"),
+    paste("Desvio padronizado em relação ao esperado:", format(round(result$sigma_score, 2), nsmall = 2), "σ"),
+    paste("Percentil normal de referência:", format(round(result$normal_percentile * 100, 2), nsmall = 2), "%"),
+    paste("Faixa sigma:", result$sigma_band, "—", result$sigma_adjective),
     sep = "\n"
   )
+}
 
+narrate_action_with_ollama <- function(result) {
   response <- httr2::request("http://127.0.0.1:11434/api/chat") |>
     httr2::req_body_json(list(
       model = "gemma4:latest",
@@ -264,26 +328,20 @@ narrate_action_with_ollama <- function(result) {
         list(
           role = "system",
           content = paste(
-            "Você narra resultados de ações em um RPG de mesa.",
-            "Responda em português brasileiro, de forma envolvente e concisa.",
-            "O código já determinou o resultado usando o percentil canônico e a dificuldade; siga essa classificação exatamente.",
-            "A dificuldade é convertida linearmente em um limiar de sucesso entre 6% e 90%: limiar = 6% + 84% × dificuldade / 100. Assim, dificuldade 97 exige percentil de pelo menos 87,48%; dificuldade 85 exige 77,40%; dificuldade 70 exige 64,80%; dificuldade 50 exige 48%; dificuldade 30 exige 31,20%; dificuldade 15 exige 18,60%; dificuldade 3 exige 8,52%. Isso garante pelo menos 5 pontos percentuais de faixa de Sucesso antes do limite canônico de Extremo (>95%), mesmo na dificuldade máxima. O limiar exato desta ação está informado na mensagem do usuário.",
-            "Marcos canônicos têm prioridade sobre o limiar: percentil < 5% é sempre Crítico (fracasso catastrófico), e percentil > 95% é sempre Extremo (sucesso espetacular). Entre 5% e o limiar de dificuldade é Falha; a partir do limiar até 95% é Sucesso. Assim, a ordem crescente dos resultados é Crítico, Falha, Sucesso e Extremo. Se o limiar for inferior a 5%, não há falha normal; se for igual ou superior a 95%, não há sucesso normal.",
-            "Se o resultado for Crítico: comece deixando explícito que o personagem falhou no objetivo imediato e narre algo terrível e sério, contrário ao que queria. Nunca narre sucesso, alívio ou sorte.",
-            "Se o resultado for Falha: comece dizendo claramente que o personagem não alcançou o objetivo descrito no evento. Narre um revés comum; progresso parcial não conta como atingir o objetivo. Não transforme a falha em sucesso e não imponha uma catástrofe de Crítico.",
-            "Se o resultado for Sucesso: comece dizendo claramente que o personagem alcançou o objetivo descrito. Narre um sucesso normal, sem catástrofe nem benefício extraordinário.",
-            "Se o resultado for Extremo: deixe claro que o personagem alcançou o objetivo de forma espetacular e obteve uma vantagem adicional extraordinária.",
-            "Use o evento para determinar o objetivo e consequências plausíveis. Não contradiga o resultado calculado nem invente detalhes incompatíveis com o contexto."
+            "Você é a narradora de um RPG de mesa.",
+            "Crie, em português brasileiro, uma narração concisa e envolvente baseada nos fatos fornecidos.",
+            "A rolagem esperada (μ) é o centro de referência: compare o valor rolado com μ e considere a diferença e o desvio padronizado (z = (rolagem − μ) / σ).",
+            "Uma diferença próxima de zero é um resultado comum para aquela ação; diferença negativa indica resultado abaixo do esperado, e positiva indica acima. Quanto maior o valor absoluto de z, mais incomum é o resultado. Use o adjetivo sigma correspondente para expressar essa intensidade.",
+            "O percentil acumulado do modelo d100 vem da curva suavizada; o percentil normal de referência e o z-score são apresentados separadamente. Use z-score e adjetivo para interpretar a distância em relação ao esperado, sem tratar o percentil suavizado como sigma.",
+            "A dificuldade descreve o desafio e a variância descreve a imprevisibilidade. Considere ambas ao narrar o efeito da rolagem: em uma ação difícil, um resultado perto da média continua sendo esperado para esse desafio; uma rolagem acima ou abaixo da média deve alterar proporcionalmente o tom ou o grau de progresso.",
+            "Calibração: com μ=70 e σ=10, uma rolagem 54,86 fica 15,14 abaixo do esperado (z≈−1,51σ, Incomum): narre uma complicação moderada, não uma catástrofe. Uma rolagem 77,45 fica 7,45 acima (z≈+0,75σ, Habitual): é um resultado favorável, mas ainda dentro do padrão comum. Uma rolagem 69,78 fica praticamente na média (z≈−0,02σ, Corriqueiro): narre o curso esperado da ação, sem exagerar sucesso ou revés.",
+            "Não imponha uma conclusão binária de sucesso ou fracasso. Narre o que aconteceu e o grau de progresso, complicação ou vantagem de forma proporcional ao evento e à posição do resultado em relação ao esperado.",
+            "Use explicitamente o adjetivo informado e não contradiga a descrição do evento nem os dados da rolagem."
           )
         ),
         list(
           role = "user",
-          content = paste(
-            user_message,
-            "",
-            "Siga a regra narrativa da classificação indicada. Mostre claramente a consequência correspondente na narração.",
-            sep = "\n"
-          )
+          content = action_narration_facts(result)
         )
       ),
       stream = FALSE
@@ -365,8 +423,7 @@ ui <- fluidPage(
     column(
       width = 8,
       h3("Distribuição dos resultados"),
-      uiOutput("tailInfo"),
-      plotOutput("plotDistribution", height = "500px"),
+      plotOutput("plotDistribution", height = "590px"),
       hr(),
       h4("Resultado da ação"),
       uiOutput("actionResult"),
@@ -474,14 +531,18 @@ server <- function(input, output, session) {
     action <- sample_action(mu, sigma)
     result <- list(
       event = analysis$event,
-      difficulty = input$selectDifficulty,
-      variance = input$selectVariance,
+      difficulty = unname(difficulty_labels[[input$selectDifficulty]]),
+      variance = unname(variance_labels[[input$selectVariance]]),
       mu = mu,
       sigma = sigma,
       roll = action$roll,
       percentile = action$percentile,
-      success_threshold = action$success_threshold,
-      outcome = action$outcome
+      expected_roll = action$expected_roll,
+      roll_delta = action$roll_delta,
+      sigma_score = action$sigma_score,
+      normal_percentile = action$normal_percentile,
+      sigma_band = action$sigma_band,
+      sigma_adjective = action$sigma_adjective
     )
     action_result(result)
     narration(NULL)
@@ -543,38 +604,27 @@ server <- function(input, output, session) {
     }
 
     tags$pre(sprintf(
-      "Rolagem: %.2f\nPercentil: %.2f%%\nPercentil mínimo para sucesso normal: %.2f%%\nResultado: %s",
+      paste(
+        "Rolagem: %.2f",
+        "Esperado (μ): %.2f | Diferença: %+.2f",
+        "Percentil acumulado do modelo d100: %.2f%%",
+        "Desvio padronizado: %+.2fσ | Percentil normal de referência: %.2f%%",
+        "Faixa sigma: %s — %s",
+        sep = "\n"
+      ),
       result$roll,
+      result$expected_roll,
+      result$roll_delta,
       result$percentile * 100,
-      result$success_threshold * 100,
-      result$outcome
+      result$sigma_score,
+      result$normal_percentile * 100,
+      result$sigma_band,
+      result$sigma_adjective
     ))
   })
 
   output$narration <- renderUI({
     tags$p(narration() %||% "A narração aparece após a rolagem.")
-  })
-
-  output$tailInfo <- renderUI({
-    mu <- suppressWarnings(as.numeric(input$mu))
-    sigma <- suppressWarnings(as.numeric(input$sigma))
-    if (length(mu) != 1L || !is.finite(mu) ||
-        length(sigma) != 1L || !is.finite(sigma) || sigma <= 0) {
-      return(tags$p("Informe parâmetros válidos para visualizar a distribuição."))
-    }
-
-    success_threshold <- success_threshold_for_difficulty(mu)
-    normal_success_start <- success_threshold
-    tags$p(sprintf(
-      paste(
-        "Crítico: < 5%% (resultado catastrófico) |",
-        "Falha normal: 5%% a %.2f%% |",
-        "Sucesso normal: %.2f%% a 95%% |",
-        "Extremo: > 95%% (sucesso espetacular)"
-      ),
-      normal_success_start * 100,
-      normal_success_start * 100
-    ))
   })
 
   output$plotDistribution <- renderPlot({
@@ -592,65 +642,33 @@ server <- function(input, output, session) {
       roll = rolls,
       percentile = d100_percentile(rolls, mu, sigma) * 100
     )
-    success_threshold <- success_threshold_for_difficulty(mu)
-    success_percentile <- success_threshold * 100
-    critical_limit <- d100_roll_for_percentile(0.05, mu, sigma)
-    success_limit <- d100_roll_for_percentile(success_percentile / 100, mu, sigma)
-    extreme_limit <- d100_roll_for_percentile(0.95, mu, sigma)
-    outcome_colors <- c(
-      "Crítico" = "#F24343",
-      "Falha" = "#ED8936",
-      "Sucesso" = "#38A169",
-      "Extremo" = "#3182CE"
+    sigma_rolls <- c(
+      0,
+      pmin(pmax(mu + sigma * (-5:5), 0), 100),
+      100
     )
-    outcome_regions <- data.frame(
-      outcome = factor(
-        c("Crítico", "Falha", "Sucesso", "Extremo"),
-        levels = names(outcome_colors)
+    sigma_colors <- stats::setNames(
+      grDevices::hcl.colors(length(sigma_band_labels), "RdYlBu", rev = TRUE),
+      sigma_band_labels
+    )
+    sigma_regions <- data.frame(
+      sigma_band = factor(
+        sigma_band_labels,
+        levels = sigma_band_labels
       ),
-      xmin = c(
-        0,
-        critical_limit,
-        success_limit,
-        extreme_limit
-      ),
-      xmax = c(
-        critical_limit,
-        success_limit,
-        extreme_limit,
-        100
-      )
+      xmin = sigma_rolls[-length(sigma_rolls)],
+      xmax = sigma_rolls[-1]
     )
     result <- action_result()
     plot <- ggplot(curve_data, aes(x = roll, y = percentile)) +
       geom_rect(
-        data = outcome_regions,
-        aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 100, fill = outcome),
+        data = sigma_regions,
+        aes(xmin = xmin, xmax = xmax, ymin = 0, ymax = 100, fill = sigma_band),
         inherit.aes = FALSE,
-        alpha = 0.14,
+        alpha = 0.16,
         colour = NA
       ) +
       geom_line(colour = "#35A9D6", linewidth = 1.2) +
-      geom_hline(
-        yintercept = c(5, success_percentile, 95),
-        linetype = "dotted",
-        colour = "grey55"
-      ) +
-      geom_vline(
-        xintercept = critical_limit,
-        linetype = "dashed",
-        colour = "#F24343"
-      ) +
-      geom_vline(
-        xintercept = extreme_limit,
-        linetype = "dashed",
-        colour = "#3182CE"
-      ) +
-      geom_vline(
-        xintercept = success_limit,
-        linetype = "dotted",
-        colour = "#276749"
-      ) +
       scale_x_continuous(
         limits = c(0, 100),
         breaks = seq(0, 100, by = 10),
@@ -663,15 +681,10 @@ server <- function(input, output, session) {
         expand = c(0, 0)
       ) +
       scale_fill_manual(
-        name = "Faixa de resultado",
-        values = outcome_colors,
-        breaks = names(outcome_colors),
-        labels = c(
-          "Crítico — fracasso catastrófico (< 5%)",
-          sprintf("Falha — objetivo não alcançado (5–%.2f%%)", success_percentile),
-          sprintf("Sucesso — objetivo alcançado (%.2f–95%%)", success_percentile),
-          "Extremo — sucesso espetacular (> 95%)"
-        ),
+        name = "Faixas de z em relação a μ (percentil normal de referência)",
+        values = sigma_colors,
+        breaks = sigma_band_labels,
+        labels = paste(sigma_adjectives, sigma_band_labels, sep = " — "),
         drop = FALSE
       ) +
       labs(
@@ -683,12 +696,12 @@ server <- function(input, output, session) {
       theme(
         legend.position = "bottom",
         legend.title = element_text(face = "bold"),
-        legend.text = element_text(size = 9)
+        legend.text = element_text(size = 8)
       ) +
       guides(fill = guide_legend(
         ncol = 2,
         byrow = TRUE,
-        override.aes = list(alpha = 0.4)
+        override.aes = list(alpha = 0.7)
       ))
 
     if (!is.null(result)) {
