@@ -42,7 +42,11 @@ cd Rrpg/RRpgT
 Rscript -e 'shiny::runApp(".")'
 ```
 
-O app apresenta um campo para descrever a ação. **Analisar evento com Jev** sugere dificuldade e variância, que podem ser ajustadas antes da rolagem. **Rodar ação** sorteia um percentil uniforme com `runif()` e o transforma pela inversa da distribuição normal truncada em 0–100 e suavizada por *smoothstep*. Assim, a curva acumulada é sigmoidal, com caudas mais suaves, e varia conforme dificuldade e variância.
+### Antes da rolagem, a cena precisa fazer sentido
+
+Ao clicar em **Analisar evento com Jev**, a proposta passa primeiro por um teste de coerência com a memória da campanha. O Jev distingue uma iniciativa criativa — mesmo ousada, arriscada ou improvável — de algo que contradiz diretamente o que já aconteceu ou é logicamente impossível naquela cena. Só o segundo caso é tratado como absurdo: o app avisa o jogador, não sugere dificuldade ou variância e interrompe o fluxo antes de qualquer rolagem. Uma proposta coerente segue normalmente para a análise de dificuldade e variância, que podem ser ajustadas antes de **Rodar ação**.
+
+Esse botão sorteia um percentil uniforme com `runif()` e o transforma pela inversa da distribuição normal truncada em 0–100 e suavizada por *smoothstep*. Assim, a curva acumulada é sigmoidal, com caudas mais suaves, e varia conforme dificuldade e variância.
 
 O Jev avalia dificuldade e variância como dimensões independentes. A dificuldade é classificada em 12 níveis, do mais alto ao mais baixo: Impossível (97), Quase impossível (93), Extremamente difícil (89), Muito difícil (85), Difícil (70), Desafiador (60), Médio (50), Moderadamente fácil (40), Fácil (30), Muito fácil (15), Quase trivial (8) e Trivial (3). Dificuldade representa o quão difícil é alcançar o objetivo; variância representa apenas o quanto o resultado é imprevisível por acaso, fatores ocultos ou circunstâncias instáveis. Uma ação pode ser difícil e previsível, ou fácil e imprevisível.
 

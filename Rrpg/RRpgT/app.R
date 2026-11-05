@@ -640,6 +640,42 @@ parse_choice_answer <- function(answer, valid_options, answer_name) {
   )
 }
 
+parse_jev_answers <- function(answers) {
+  if (!is.list(answers) || is.null(answers$coherence)) {
+    stop("A resposta do Jev não contém a validação de coerência esperada.",
+         call. = FALSE)
+  }
+
+  coherence <- parse_choice_answer(
+    answers$coherence,
+    c("coherent", "absurd"),
+    "coerência com o contexto"
+  )
+  if (identical(coherence$choice, "absurd")) {
+    return(list(coherent = FALSE, coherence = coherence))
+  }
+
+  if (is.null(answers$difficulty) || is.null(answers$variance)) {
+    stop("A resposta coerente do Jev não contém dificuldade e variância.",
+         call. = FALSE)
+  }
+
+  list(
+    coherent = TRUE,
+    coherence = coherence,
+    difficulty = parse_choice_answer(
+      answers$difficulty,
+      names(difficulty_mu),
+      "dificuldade"
+    ),
+    variance = parse_choice_answer(
+      answers$variance,
+      names(variance_sigma),
+      "variância"
+    )
+  )
+}
+
 classify_event_with_jev <- function(event_description, campaign_context) {
   api_key <- trimws(Sys.getenv("TYPESAFE_API_KEY", unset = ""))
   if (!nzchar(api_key)) {
@@ -688,10 +724,24 @@ classify_event_with_jev <- function(event_description, campaign_context) {
     model = "jev-latest",
     state = format_jev_state(event_description, campaign_context),
     questions = list(
+      coherence = list(
+        type = "choice",
+        instructions = paste(
+          "Antes de classificar a ação, avalie se ela é coerente com os fatos estabelecidos no contexto da aventura.",
+          "Use coherent quando a ação puder acontecer na cena, inclusive se for criativa, improvável, arriscada ou introduzir uma ideia nova que não contradiga fatos conhecidos.",
+          "Use absurd somente quando a ação contradizer diretamente um fato estabelecido ou for logicamente impossível dentro da situação descrita.",
+          "Não considere uma ação absurda apenas por ser difícil, ousada, inesperada ou pouco provável.",
+          "Se escolher absurd, não classifique dificuldade nem variância."
+        ),
+        criteria = list(
+          coherent = "A ação é compatível com a situação e os fatos já estabelecidos, ou é uma iniciativa nova plausível.",
+          absurd = "A ação contradiz diretamente fatos estabelecidos ou é logicamente impossível na cena atual."
+        )
+      ),
       difficulty = list(
         type = "choice",
         instructions = paste(
-          "Classifique a dificuldade da ação descrita.",
+          "Se a resposta de coerência for coherent, classifique a dificuldade da ação descrita.",
           "Escolha a opção que melhor representa o desafio para o personagem."
         ),
         criteria = difficulty_criteria
@@ -699,6 +749,7 @@ classify_event_with_jev <- function(event_description, campaign_context) {
       variance = list(
         type = "choice",
         instructions = paste(
+          "Se a resposta de coerência for coherent, classifique a variância da ação.",
           "Classifique exclusivamente a imprevisibilidade do resultado desta ação, não a dificuldade de realizá-la.",
           "Pergunte: mantendo a ação e a competência do personagem, quão incerto é o resultado por causa de acaso, fatores ocultos ou circunstâncias instáveis?",
           "Se o resultado pode ser previsto com segurança e deve variar pouco, escolha baixa variância (Esperada ou Previsível).",
@@ -719,25 +770,12 @@ classify_event_with_jev <- function(event_description, campaign_context) {
   httr2::resp_check_status(response)
   body <- httr2::resp_body_json(response, simplifyVector = FALSE)
 
-  if (!is.list(body$answers) ||
-      is.null(body$answers$difficulty) ||
-      is.null(body$answers$variance)) {
-    stop("A resposta do Jev não contém as duas classificações esperadas.",
+  if (!is.list(body$answers)) {
+    stop("A resposta do Jev não contém classificações válidas.",
          call. = FALSE)
   }
 
-  list(
-    difficulty = parse_choice_answer(
-      body$answers$difficulty,
-      names(difficulty_mu),
-      "dificuldade"
-    ),
-    variance = parse_choice_answer(
-      body$answers$variance,
-      names(variance_sigma),
-      "variância"
-    )
-  )
+  parse_jev_answers(body$answers)
 }
 
 action_narration_facts <- function(result) {
@@ -1443,6 +1481,13 @@ server <- function(input, output, session) {
     if (is.null(result)) {
       return()
     }
+    if (!isTRUE(result$coherent)) {
+      status_message(paste(
+        "O Jev considerou a entrada incoerente ou absurda em relação ao contexto da aventura.",
+        "Nada foi executado. Ajuste a descrição para combinar com a cena e tente novamente."
+      ))
+      return()
+    }
 
     jev_result(list(
       event = event,
@@ -1698,6 +1743,10 @@ server <- function(input, output, session) {
 
     tags$details(
       tags$summary("Sugestão do Jev"),
+      p(sprintf(
+        "Coerência com o contexto: confirmada (confiança %.0f%%)",
+        classification$coherence$confidence * 100
+      )),
       p(sprintf(
         "Dificuldade: %s (confiança %.0f%%; %s)",
         difficulty_labels[[classification$difficulty$choice]],
