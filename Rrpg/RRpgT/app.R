@@ -386,34 +386,22 @@ action_narration_facts <- function(result) {
   )
 }
 
-narrate_action_with_ollama <- function(
-  result,
+stream_ollama_response <- function(
+  system_prompt,
+  user_prompt,
   on_token,
   on_complete,
   on_error,
   register_cancel,
-  is_cancelled
+  is_cancelled,
+  empty_response_message = "Ollama retornou uma resposta vazia ou em formato inválido."
 ) {
   request <- httr2::request("http://127.0.0.1:11434/api/chat") |>
     httr2::req_body_json(list(
       model = "gemma4:latest",
       messages = list(
-        list(
-          role = "system",
-          content = paste(
-            "Você é o Mestre de Jogo e está narrando uma cena de RPG em andamento. Faça roleplay: fale como quem conduz a cena para os jogadores, não como alguém que avalia a ficha ou comenta uma jogada.",
-            "Use o contexto anterior como memória da aventura e as informações da ação atual somente como orientação interna. Continue a história a partir do que já aconteceu, mantenha personagens, lugares e fatos consistentes e não reinicie a aventura.",
-            "Responda com a cena acontecendo agora: descreva ações, gestos, expressões, sons, ambiente e consequências que os personagens percebem.",
-            "Não explique nem avalie a capacidade, o desempenho, a persuasão ou a convicção do personagem. Não dê notas, níveis, categorias ou rótulos à ação ou ao personagem.",
-            "Não mencione regras, jogo, rolagem, dados, resultados, atributos, perícias, dificuldade, sorte, probabilidade ou qualquer outra mecânica. Não escreva cabeçalhos nem anuncie SUCESSO ou FALHA: mostre o desfecho somente pelo que acontece na ficção.",
-            "Escreva em português brasileiro coloquial, como uma fala teatral e vívida do DM. Quando couber, interprete os personagens com falas curtas em discurso direto. Prefira duas ou três frases curtas e não invente detalhes que contradigam a situação.",
-            "Mantenha o desfecho indicado nas informações internas, mas não o nomeie nem o explique; narre apenas a consequência vivida pelos personagens."
-          )
-        ),
-        list(
-          role = "user",
-          content = action_narration_facts(result)
-        )
+        list(role = "system", content = system_prompt),
+        list(role = "user", content = user_prompt)
       ),
       stream = TRUE
     )) |>
@@ -495,11 +483,11 @@ narrate_action_with_ollama <- function(
           if (cancelled || is_cancelled()) {
             return(invisible(NULL))
           }
-          if (!nzchar(trimws(paste0(chunks, collapse = "")))) {
-            stop("Ollama retornou uma narração vazia ou em formato inválido.",
-                 call. = FALSE)
+          full_response <- paste0(chunks, collapse = "")
+          if (!nzchar(trimws(full_response))) {
+            stop(empty_response_message, call. = FALSE)
           }
-          on_complete()
+          on_complete(full_response)
           return(invisible(NULL))
         }
       }
@@ -510,6 +498,72 @@ narrate_action_with_ollama <- function(
 
   later::later(read_next, delay = 0)
   invisible(NULL)
+}
+
+narrate_action_with_ollama <- function(
+  result,
+  on_token,
+  on_complete,
+  on_error,
+  register_cancel,
+  is_cancelled
+) {
+  stream_ollama_response(
+    system_prompt = paste(
+      "Você é o Mestre de Jogo e está narrando uma cena de RPG em andamento. Faça roleplay: fale como quem conduz a cena para os jogadores, não como alguém que avalia a ficha ou comenta uma jogada.",
+      "Use o contexto anterior como memória da aventura e as informações da ação atual somente como orientação interna. Continue a história a partir do que já aconteceu, mantenha personagens, lugares e fatos consistentes e não reinicie a aventura.",
+      "Responda com a cena acontecendo agora: descreva ações, gestos, expressões, sons, ambiente e consequências que os personagens percebem.",
+      "Não explique nem avalie a capacidade, o desempenho, a persuasão ou a convicção do personagem. Não dê notas, níveis, categorias ou rótulos à ação ou ao personagem.",
+      "Não mencione regras, jogo, rolagem, dados, resultados, atributos, perícias, dificuldade, sorte, probabilidade ou qualquer outra mecânica. Não escreva cabeçalhos nem anuncie SUCESSO ou FALHA: mostre o desfecho somente pelo que acontece na ficção.",
+      "Escreva em português brasileiro coloquial, como uma fala teatral e vívida do DM. Quando couber, interprete os personagens com falas curtas em discurso direto. Prefira duas ou três frases curtas e não invente detalhes que contradigam a situação.",
+      "Mantenha o desfecho indicado nas informações internas, mas não o nomeie nem o explique; narre apenas a consequência vivida pelos personagens.",
+      sep = "\n"
+    ),
+    user_prompt = action_narration_facts(result),
+    on_token = on_token,
+    on_complete = on_complete,
+    on_error = on_error,
+    register_cancel = register_cancel,
+    is_cancelled = is_cancelled,
+    empty_response_message = "Ollama retornou uma narração vazia ou em formato inválido."
+  )
+}
+
+campaign_narration_prompts <- function(campaign_context) {
+  list(
+    system = paste(
+      "Você é o Mestre de Jogo de uma aventura de fantasia em andamento.",
+      "Continue a história a partir do contexto fornecido. Narre um novo momento interessante e coerente, sem recontar o resumo, sem decidir ações pelos jogadores e sem resolver por eles escolhas ainda abertas.",
+      "Use roleplay teatral em português brasileiro coloquial: descreva o que os personagens veem, ouvem e sentem, e inclua falas curtas de personagens quando fizer sentido.",
+      "Não mencione jogo, regras, rolagens, atributos ou qualquer jargão técnico. Escreva de duas a quatro frases, deixando uma situação ou oportunidade clara para os jogadores responderem.",
+      sep = "\n"
+    ),
+    user = paste(
+      "CONTEXTO ATUAL DA AVENTURA:",
+      campaign_context,
+      "",
+      "Continue a cena agora, sem decidir o que os aventureiros fazem.",
+      sep = "\n"
+    )
+  )
+}
+
+character_action_prompts <- function(campaign_context) {
+  list(
+    system = paste(
+      "Você interpreta um dos aventureiros jogadores desta história. Leia o contexto da aventura e proponha uma ação que esse personagem poderia tentar neste momento.",
+      "Responda somente com uma frase curta em primeira pessoa, descrevendo uma intenção concreta para preencher o campo de ação. Não narre o resultado, não faça a ação acontecer e não inclua explicações, alternativas, aspas ou comentários.",
+      "Mantenha a proposta coerente com o que já aconteceu e não invente poderes, objetos ou informações pessoais que não estejam estabelecidos.",
+      sep = "\n"
+    ),
+    user = paste(
+      "CONTEXTO ATUAL DA AVENTURA:",
+      campaign_context,
+      "",
+      "Escreva uma ação que meu personagem tenta realizar agora.",
+      sep = "\n"
+    )
+  )
 }
 
 ui <- fluidPage(
@@ -538,6 +592,9 @@ ui <- fluidPage(
         placeholder = "Ex.: atravessar uma ponte antiga enquanto ela desaba..."
       ),
       actionButton("analyzeEvent", "Analisar evento com Jev"),
+      br(),
+      br(),
+      actionButton("simulateCharacterAction", "Simular ação de personagem"),
       hr(),
       uiOutput("statusText"),
       uiOutput("campaignContext"),
@@ -582,7 +639,12 @@ ui <- fluidPage(
       h3("Distribuição dos resultados"),
       plotOutput("plotDistribution", height = "590px"),
       hr(),
-      h4("Narração"),
+      div(
+        style = "display:flex;align-items:center;gap:10px;",
+        h4("Narração", style = "margin:0;"),
+        actionButton("generateNarrative", "Gerar Narrativa")
+      ),
+      br(),
       uiOutput("narration"),
       h4("Resultado da ação"),
       uiOutput("actionResult")
@@ -601,6 +663,7 @@ server <- function(input, output, session) {
   active_cancel <- reactiveVal(NULL)
   campaign_memory <- reactiveVal(list())
   campaign_narrative <- reactiveVal(character())
+  campaign_story_stream <- reactiveVal(NULL)
 
   set_generation_running <- function(running) {
     generation_running(running)
@@ -633,6 +696,142 @@ server <- function(input, output, session) {
 
   observeEvent(input$cancelAction, {
     cancel_active_generation()
+  })
+
+  start_streaming_generation <- function(
+    start_stream,
+    on_token,
+    on_complete,
+    on_error
+  ) {
+    current_generation <- generation_id() + 1L
+    generation_id(current_generation)
+    active_generation(current_generation)
+    active_cancel(NULL)
+    set_generation_running(TRUE)
+
+    is_current_generation <- function() {
+      identical(
+        shiny::isolate(active_generation()),
+        current_generation
+      )
+    }
+
+    session$onFlushed(function() {
+      later::later(function() {
+        if (!is_current_generation()) {
+          return()
+        }
+
+        start_stream(
+          on_token = function(token) {
+            if (!is_current_generation()) {
+              return()
+            }
+            on_token(token)
+            session$flushOutput()
+          },
+          on_complete = function(response_text) {
+            if (!is_current_generation()) {
+              return()
+            }
+            active_generation(NULL)
+            active_cancel(NULL)
+            set_generation_running(FALSE)
+            on_complete(response_text)
+            session$flushOutput()
+          },
+          on_error = function(message) {
+            if (!is_current_generation()) {
+              return()
+            }
+            active_generation(NULL)
+            active_cancel(NULL)
+            set_generation_running(FALSE)
+            on_error(message)
+            session$flushOutput()
+          },
+          register_cancel = function(cancel) {
+            active_cancel(cancel)
+          },
+          is_cancelled = function() {
+            !is_current_generation()
+          }
+        )
+      }, delay = 0.05)
+    }, once = TRUE)
+  }
+
+  observeEvent(input$generateNarrative, {
+    cancel_active_generation(message = NULL, flush = FALSE)
+    context_snapshot <- format_campaign_context(campaign_memory())
+    prompts <- campaign_narration_prompts(context_snapshot)
+    campaign_story_stream("")
+    status_message("Gerando continuação da aventura...")
+
+    start_streaming_generation(
+      start_stream = function(...) {
+        stream_ollama_response(
+          system_prompt = prompts$system,
+          user_prompt = prompts$user,
+          ...,
+          empty_response_message = "Ollama retornou uma continuação vazia."
+        )
+      },
+      on_token = function(token) {
+        campaign_story_stream(paste0(
+          shiny::isolate(campaign_story_stream()),
+          token
+        ))
+      },
+      on_complete = function(response_text) {
+        campaign_memory(append_campaign_memory(
+          shiny::isolate(campaign_memory()),
+          "Continuação da narrativa",
+          response_text
+        ))
+        campaign_narrative(utils::tail(
+          c(shiny::isolate(campaign_narrative()), response_text),
+          campaign_memory_limit
+        ))
+        campaign_story_stream(NULL)
+        status_message("Narrativa atualizada.")
+      },
+      on_error = function(message) {
+        status_message(paste("Não foi possível gerar a narrativa:", message))
+      }
+    )
+  })
+
+  observeEvent(input$simulateCharacterAction, {
+    cancel_active_generation(message = NULL, flush = FALSE)
+    prompts <- character_action_prompts(
+      format_campaign_context(campaign_memory())
+    )
+    status_message("Criando uma sugestão de ação para um personagem...")
+
+    start_streaming_generation(
+      start_stream = function(...) {
+        stream_ollama_response(
+          system_prompt = prompts$system,
+          user_prompt = prompts$user,
+          ...,
+          empty_response_message = "Ollama não sugeriu uma ação."
+        )
+      },
+      on_token = function(token) invisible(NULL),
+      on_complete = function(response_text) {
+        updateTextAreaInput(
+          session,
+          "eventDescription",
+          value = trimws(response_text)
+        )
+        status_message("Ação sugerida no campo. Revise e analise com Jev quando quiser.")
+      },
+      on_error = function(message) {
+        status_message(paste("Não foi possível sugerir uma ação:", message))
+      }
+    )
   })
 
   observeEvent(input$eventDescription, ignoreInit = TRUE, {
@@ -755,88 +954,42 @@ server <- function(input, output, session) {
     result$outcome <- if (result$success) "SUCESSO" else "FALHA"
     action_result(result)
     narration(NULL)
+    campaign_story_stream("")
     status_message("Rolagem exibida no gráfico. Gerando a narração local...")
-    current_generation <- generation_id() + 1L
-    generation_id(current_generation)
-    active_generation(current_generation)
-    active_cancel(NULL)
-    set_generation_running(TRUE)
-    session$onFlushed(function() {
-      later::later(function() {
-        if (!identical(
-          shiny::isolate(active_generation()),
-          current_generation
-        )) {
-          return()
-        }
-
-        narration_chunks <- character()
+    start_streaming_generation(
+      start_stream = function(...) {
         narrate_action_with_ollama(
           result,
-          on_token = function(token) {
-            if (!identical(
-              shiny::isolate(active_generation()),
-              current_generation
-            )) {
-              return()
-            }
-            narration_chunks <<- c(narration_chunks, token)
-            narration(paste0(narration_chunks, collapse = ""))
-            session$flushOutput()
-          },
-          on_complete = function() {
-            if (!identical(
-              shiny::isolate(active_generation()),
-              current_generation
-            )) {
-              return()
-            }
-            active_generation(NULL)
-            active_cancel(NULL)
-            set_generation_running(FALSE)
-            campaign_memory(append_campaign_memory(
-              shiny::isolate(campaign_memory()),
-              result$event,
-              paste0(narration_chunks, collapse = "")
-            ))
-            campaign_narrative(utils::tail(
-              c(
-                shiny::isolate(campaign_narrative()),
-                paste0(narration_chunks, collapse = "")
-              ),
-              campaign_memory_limit
-            ))
-            status_message("Ação e narração concluídas.")
-            session$flushOutput()
-          },
-          on_error = function(message) {
-            if (!identical(
-              shiny::isolate(active_generation()),
-              current_generation
-            )) {
-              return()
-            }
-            active_generation(NULL)
-            active_cancel(NULL)
-            set_generation_running(FALSE)
-            status_message(paste(
-              "A ação foi calculada, mas a narração falhou:",
-              message
-            ))
-            session$flushOutput()
-          },
-          register_cancel = function(cancel) {
-            active_cancel(cancel)
-          },
-          is_cancelled = function() {
-            !identical(
-              shiny::isolate(active_generation()),
-              current_generation
-            )
-          }
+          ...
         )
-      }, delay = 0.05)
-    }, once = TRUE)
+      },
+      on_token = function(token) {
+        narration(paste0(shiny::isolate(narration()), token))
+        campaign_story_stream(paste0(
+          shiny::isolate(campaign_story_stream()),
+          token
+        ))
+      },
+      on_complete = function(response_text) {
+        campaign_memory(append_campaign_memory(
+          shiny::isolate(campaign_memory()),
+          result$event,
+          response_text
+        ))
+        campaign_narrative(utils::tail(
+          c(shiny::isolate(campaign_narrative()), response_text),
+          campaign_memory_limit
+        ))
+        campaign_story_stream(NULL)
+        status_message("Ação e narração concluídas.")
+      },
+      on_error = function(message) {
+        status_message(paste(
+          "A ação foi calculada, mas a narração falhou:",
+          message
+        ))
+      }
+    )
   })
 
   session$onSessionEnded(function() {
@@ -847,7 +1000,7 @@ server <- function(input, output, session) {
 
   output$campaignStory <- renderUI({
     completed_narration <- campaign_narrative()
-    current_narration <- narration()
+    current_narration <- campaign_story_stream()
     show_current <- !is.null(current_narration) &&
       nzchar(current_narration) &&
       (length(completed_narration) == 0L ||
