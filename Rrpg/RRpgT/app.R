@@ -368,7 +368,13 @@ retrieve_campaign_context <- function(
 ) {
   ensure_campaign_seed(connection, campaign_id)
   index_pending_campaign_memories(connection, campaign_id)
-  query_vector <- campaign_embedding_vectors(query)[[1]]
+  query_vectors <- campaign_embedding_vectors(query)
+  query_norms <- vapply(query_vectors, function(vector) {
+    sqrt(sum(vector^2))
+  }, numeric(1))
+  if (any(!is.finite(query_norms)) || any(query_norms == 0)) {
+    stop("Um vetor da consulta não pode ter norma zero.", call. = FALSE)
+  }
   memories <- DBI::dbGetQuery(
     connection,
     paste(
@@ -387,21 +393,19 @@ retrieve_campaign_context <- function(
   selected <- candidates[FALSE, , drop = FALSE]
   if (nrow(candidates) > 0L) {
     candidate_vectors <- lapply(candidates$embedding, decode_campaign_embedding)
-    query_norm <- sqrt(sum(query_vector^2))
-    if (!is.finite(query_norm) || query_norm == 0) {
-      stop("O vetor da consulta não pode ter norma zero.", call. = FALSE)
-    }
     similarity <- vapply(candidate_vectors, function(vector) {
-      if (length(vector) != length(query_vector)) {
+      if (length(vector) != length(query_vectors[[1]])) {
         stop(
           "A dimensão de um vetor salvo não corresponde ao modelo de embedding atual.",
           call. = FALSE
         )
       }
       vector_norm <- sqrt(sum(vector^2))
-      if (vector_norm == 0) 0 else {
-        sum(vector * query_vector) / (vector_norm * query_norm)
-      }
+      if (vector_norm == 0) return(0)
+      max(vapply(seq_along(query_vectors), function(index) {
+        sum(vector * query_vectors[[index]]) /
+          (vector_norm * query_norms[[index]])
+      }, numeric(1)))
     }, numeric(1))
 
     relevant_indices <- head(
@@ -448,24 +452,122 @@ campaign_memory_archive <- function(connection, campaign_id) {
   )
 }
 
-campaign_narrations <- function(connection, campaign_id) {
+campaign_story_entries <- function(connection, campaign_id) {
   memories <- DBI::dbGetQuery(
     connection,
     paste(
-      "SELECT metadata FROM campaign_memories",
+      "SELECT id, kind, metadata FROM campaign_memories",
       "WHERE campaign_id = ? AND kind IN ('action', 'narrative')",
       "ORDER BY id"
     ),
     params = list(campaign_id)
   )
-  narrations <- lapply(memories$metadata, function(encoded) {
-    jsonlite::fromJSON(encoded, simplifyVector = FALSE)$narration
+  lapply(seq_len(nrow(memories)), function(index) {
+    metadata <- jsonlite::fromJSON(
+      memories$metadata[[index]],
+      simplifyVector = FALSE
+    )
+    list(
+      id = memories$id[[index]],
+      kind = memories$kind[[index]],
+      event = metadata$event %||% NULL,
+      narration = metadata$narration %||% NULL
+    )
   })
-  Filter(
-    function(text) is.character(text) && length(text) == 1L &&
-      !is.na(text) && nzchar(trimws(text)),
-    narrations
+}
+
+character_sheet_prompts <- function(campaign_context) {
+  list(
+    system = paste(
+      "Você mantém a ficha do personagem principal de uma campanha de RPG.",
+      "Use exclusivamente os fatos explicitamente presentes nas memórias fornecidas. Não invente nem deduza valores mecânicos. Diferencie o personagem principal dos companheiros e não transforme uma intenção em fato consumado; registre equipamento como possuído somente quando a narrativa confirmar que está com o personagem.",
+      "A fala em primeira pessoa do jogador identifica o protagonista; afirmações como 'sou o/a [classe] [nome]' são evidência direta para os campos nome e classe. Use as menções ao deus ou à divindade feitas pelo próprio protagonista para preencher divindade.",
+      "Quando um dado não estiver estabelecido, use null; para listas sem fatos confirmados, use []. Atualize a ficha considerando todas as memórias, preservando fatos anteriores que não foram contraditos.",
+      "Responda somente com um objeto JSON válido, sem Markdown, comentários ou texto antes/depois. Use exatamente este esquema:",
+      '{"name":null,"class":null,"ancestry":null,"background":null,"deity":null,"level":null,"hit_points":null,"attributes":{"strength":null,"dexterity":null,"constitution":null,"intelligence":null,"wisdom":null,"charisma":null},"skills":[],"abilities":[],"equipment":[],"companions":[],"other_facts":[]}',
+      "Campos textuais devem ser strings ou null; level e hit_points devem ser números ou null; attributes deve conter exatamente os seis atributos, cada um numérico ou null; listas devem conter somente strings confirmadas.",
+      "A ficha é do personagem principal, não de um companheiro. Mantenha nomes e descrições conforme registrados e escreva em português.",
+      sep = "\n"
+    ),
+    user = paste(
+      "Atualize a ficha do personagem principal com base nestas memórias recuperadas da base vetorial da campanha:",
+      campaign_context,
+      sep = "\n\n"
+    )
   )
+}
+
+parse_character_sheet <- function(response_text) {
+  sheet <- jsonlite::fromJSON(response_text, simplifyVector = FALSE)
+  required_fields <- c(
+    "name", "class", "ancestry", "background", "deity", "level",
+    "hit_points", "attributes", "skills", "abilities", "equipment",
+    "companions", "other_facts"
+  )
+  if (!is.list(sheet) || !all(required_fields %in% names(sheet))) {
+    stop("A resposta da LLM não contém todos os campos da ficha.",
+         call. = FALSE)
+  }
+
+  text_fields <- c(
+    "name", "class", "ancestry", "background", "deity"
+  )
+  invalid_text <- vapply(text_fields, function(field) {
+    value <- sheet[[field]]
+    !is.null(value) &&
+      (!is.character(value) || length(value) != 1L || is.na(value))
+  }, logical(1))
+  if (any(invalid_text)) {
+    stop("A LLM retornou um campo textual inválido na ficha.",
+         call. = FALSE)
+  }
+
+  numeric_fields <- c("level", "hit_points")
+  invalid_numeric <- vapply(numeric_fields, function(field) {
+    value <- sheet[[field]]
+    !is.null(value) &&
+      (!is.numeric(value) || length(value) != 1L || !is.finite(value))
+  }, logical(1))
+  if (any(invalid_numeric)) {
+    stop("A LLM retornou um valor numérico inválido na ficha.",
+         call. = FALSE)
+  }
+
+  attribute_fields <- c(
+    "strength", "dexterity", "constitution",
+    "intelligence", "wisdom", "charisma"
+  )
+  attributes <- sheet$attributes
+  if (!is.list(attributes) ||
+      !all(attribute_fields %in% names(attributes))) {
+    stop("A LLM retornou atributos incompletos na ficha.",
+         call. = FALSE)
+  }
+  invalid_attributes <- vapply(attribute_fields, function(field) {
+    value <- attributes[[field]]
+    !is.null(value) &&
+      (!is.numeric(value) || length(value) != 1L || !is.finite(value))
+  }, logical(1))
+  if (any(invalid_attributes)) {
+    stop("A LLM retornou um atributo inválido na ficha.",
+         call. = FALSE)
+  }
+
+  list_fields <- c(
+    "skills", "abilities", "equipment", "companions", "other_facts"
+  )
+  invalid_lists <- vapply(list_fields, function(field) {
+    value <- sheet[[field]]
+    !is.list(value) ||
+      any(!vapply(value, function(item) {
+        is.character(item) && length(item) == 1L && !is.na(item)
+      }, logical(1)))
+  }, logical(1))
+  if (any(invalid_lists)) {
+    stop("A LLM retornou uma lista inválida na ficha.",
+         call. = FALSE)
+  }
+  sheet
 }
 
 campaign_memory_summary <- function(connection, campaign_id) {
@@ -674,6 +776,94 @@ parse_jev_answers <- function(answers) {
       "variância"
     )
   )
+}
+
+parse_dm_context_review <- function(answers) {
+  if (!is.list(answers) ||
+      is.null(answers$consistency) ||
+      is.null(answers$fundamental_plausibility)) {
+    stop("A resposta do Jev não contém as duas validações de contexto esperadas.",
+         call. = FALSE)
+  }
+
+  consistency <- parse_choice_answer(
+    answers$consistency,
+    c("consistent", "contradiction"),
+    "contradição com o contexto"
+  )
+  fundamental_plausibility <- parse_choice_answer(
+    answers$fundamental_plausibility,
+    c("plausible", "fundamentally_absurd"),
+    "absurdo fundamental"
+  )
+  list(
+    accepted = identical(consistency$choice, "consistent") &&
+      identical(fundamental_plausibility$choice, "plausible"),
+    consistency = consistency,
+    fundamental_plausibility = fundamental_plausibility
+  )
+}
+
+validate_dm_context_with_jev <- function(new_context, campaign_context) {
+  api_key <- trimws(Sys.getenv("TYPESAFE_API_KEY", unset = ""))
+  if (!nzchar(api_key)) {
+    stop("Configure a variável de ambiente TYPESAFE_API_KEY para usar o Jev.",
+         call. = FALSE)
+  }
+
+  request_body <- list(
+    model = "jev-latest",
+    state = paste(
+      "CONTEXTO ATUAL DA CAMPANHA:",
+      campaign_context,
+      "",
+      "INFORMAÇÃO NOVA PROPOSTA PARA O CONTEXTO DO DM:",
+      new_context,
+      sep = "\n"
+    ),
+    questions = list(
+      consistency = list(
+        type = "choice",
+        instructions = paste(
+          "Avalie somente se a informação nova contradiz diretamente algum fato estabelecido no contexto atual da campanha.",
+          "Use consistent se não houver contradição explícita, inclusive quando a informação acrescentar um fato novo ainda não conhecido.",
+          "Use contradiction somente quando os dois fatos não puderem ser verdadeiros ao mesmo tempo.",
+          "Não avalie ações de personagens, dificuldade, variância, conveniência narrativa ou se a informação já era conhecida."
+        ),
+        criteria = list(
+          consistent = "Informação nova compatível com os fatos atuais, ou que os complementa sem conflito.",
+          contradiction = "Afirmação que conflita diretamente com um fato estabelecido no contexto atual."
+        )
+      ),
+      fundamental_plausibility = list(
+        type = "choice",
+        instructions = paste(
+          "Avalie somente se a informação é absurda em nível fundamental.",
+          "Aceite elementos fantásticos próprios de uma aventura de fantasia e fatos novos que não contradigam o contexto.",
+          "Use fundamentally_absurd apenas para algo logicamente impossível ou sem sentido até mesmo como fato de fantasia.",
+          "Não rejeite algo apenas por ser raro, extraordinário, mágico, surpreendente ou improvável.",
+          "Não classifique dificuldade ou variância."
+        ),
+        criteria = list(
+          plausible = "Informação compreensível e fundamentalmente possível dentro de uma aventura de fantasia.",
+          fundamentally_absurd = "Informação sem sentido ou logicamente impossível até mesmo no contexto fantástico."
+        )
+      )
+    )
+  )
+
+  response <- httr2::request("https://api.typesafe.ai/v1/systemone") |>
+    httr2::req_headers(Authorization = paste("Bearer", api_key)) |>
+    httr2::req_body_json(request_body) |>
+    httr2::req_timeout(30) |>
+    httr2::req_perform()
+  httr2::resp_check_status(response)
+  body <- httr2::resp_body_json(response, simplifyVector = FALSE)
+  if (!is.list(body$answers)) {
+    stop("A resposta do Jev não contém validações de contexto válidas.",
+         call. = FALSE)
+  }
+  parse_dm_context_review(body$answers)
 }
 
 classify_event_with_jev <- function(event_description, campaign_context) {
@@ -1024,13 +1214,51 @@ character_action_prompts <- function(campaign_context) {
 
 ui <- fluidPage(
   title = "Sala de Controle do DM",
+  tags$script(HTML("
+    (function() {
+      function attachCampaignStoryScroll() {
+        var output = document.getElementById('campaignStory');
+        if (!output) return;
+
+        function scrollToEnd() {
+          var story = output.querySelector('#campaign-story-scroll');
+          if (story) story.scrollTop = story.scrollHeight;
+        }
+
+        new MutationObserver(function() {
+          window.requestAnimationFrame(scrollToEnd);
+        }).observe(output, { childList: true, subtree: true });
+
+        window.requestAnimationFrame(scrollToEnd);
+      }
+
+      $(document).one('shiny:connected', attachCampaignStoryScroll);
+    })();
+  ")),
   fluidRow(
     wellPanel(
       style = "background-color:#494949;",
       width = "100%",
-      h1(
-        "Sala de Controle do DM",
-        style = "text-align:center;font-weight:bold;color:white;"
+      div(
+        style = paste(
+          "display:flex;align-items:center;justify-content:center;",
+          "position:relative;"
+        ),
+        h1(
+          "Sala de Controle do DM",
+          style = "margin:10px 0;font-weight:bold;color:white;"
+        ),
+        actionButton(
+          "showCharacterSheet",
+          label = NULL,
+          icon = icon("user"),
+          title = "Abrir ficha do personagem",
+          class = "btn-default",
+          style = paste(
+            "position:absolute;right:0;",
+            "background:transparent;color:white;border-color:white;"
+          )
+        )
       )
     )
   ),
@@ -1093,7 +1321,7 @@ ui <- fluidPage(
     column(
       width = 8,
       h3("Distribuição dos resultados"),
-      plotOutput("plotDistribution", height = "590px"),
+      plotOutput("plotDistribution", height = "460px"),
       hr(),
       div(
         style = "display:flex;align-items:center;gap:10px;",
@@ -1104,7 +1332,18 @@ ui <- fluidPage(
       br(),
       uiOutput("narration"),
       h4("Resultado da ação"),
-      uiOutput("actionResult")
+      uiOutput("actionResult"),
+      hr(),
+      h3("Contexto do DM"),
+      textAreaInput(
+        "dmContext",
+        "Informações novas para a campanha",
+        value = "",
+        rows = 4,
+        width = "100%",
+        placeholder = "Ex.: A estrada ao norte cruza uma velha ponte de pedra..."
+      ),
+      actionButton("addDmContext", "Validar e adicionar contexto")
     )
   )
 )
@@ -1137,12 +1376,19 @@ server <- function(input, output, session) {
     sep = "\n"
   ))
   campaign_revision <- reactiveVal(0L)
+  character_sheet_revision <- reactiveVal(0L)
+  character_sheet <- reactiveVal(NULL)
+  character_sheet_status <- reactiveVal("Aguardando a leitura da memória da campanha.")
+  character_sheet_generation <- reactiveVal(0L)
+  character_sheet_cancel <- reactiveVal(NULL)
+  character_sheet_dirty <- reactiveVal(FALSE)
 
   persist_campaign_memory <- function(
     kind,
     content,
     metadata,
-    memory_id = NULL
+    memory_id = NULL,
+    refresh_sheet = TRUE
   ) {
     if (is.null(memory_id)) {
       memory_id <- tryCatch(
@@ -1188,6 +1434,14 @@ server <- function(input, output, session) {
       index_pending_campaign_memories(campaign_store, campaign_id)
       NULL
     }, error = function(error) conditionMessage(error))
+    if (isTRUE(refresh_sheet)) {
+      character_sheet_dirty(FALSE)
+      character_sheet_revision(
+        shiny::isolate(character_sheet_revision()) + 1L
+      )
+    } else {
+      character_sheet_dirty(TRUE)
+    }
     list(
       id = memory_id,
       persisted = TRUE,
@@ -1219,6 +1473,130 @@ server <- function(input, output, session) {
     }
     success_message
   }
+
+  refresh_character_sheet <- function() {
+    previous_cancel <- shiny::isolate(character_sheet_cancel())
+    if (is.function(previous_cancel)) {
+      previous_cancel()
+    }
+
+    request_id <- shiny::isolate(character_sheet_generation()) + 1L
+    character_sheet_generation(request_id)
+    character_sheet_cancel(NULL)
+    character_sheet_status("Atualizando a ficha com a memória da campanha...")
+
+    context <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        paste(
+          "FICHA DO PERSONAGEM PRINCIPAL:",
+          "nome, classe, ancestralidade e divindade do protagonista;",
+          "nomes, descrições e funções de seus companheiros;",
+          "nível, pontos de vida, atributos, perícias, habilidades e equipamento confirmados."
+        ),
+        relevant_limit = 30L,
+        recent_limit = 10L
+      ),
+      error = function(error) {
+        character_sheet_status(paste(
+          "Não foi possível recuperar a memória vetorial para a ficha:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(context)) {
+      return(invisible(NULL))
+    }
+
+    prompts <- character_sheet_prompts(context)
+    is_current_request <- function() {
+      !session$isClosed() &&
+        identical(
+          shiny::isolate(character_sheet_generation()),
+          request_id
+        )
+    }
+    flush_sheet <- function() {
+      if (!session$isClosed()) {
+        session$flushOutput()
+      }
+    }
+
+    tryCatch(
+      stream_ollama_response(
+        system_prompt = prompts$system,
+        user_prompt = prompts$user,
+        on_token = function(token) invisible(NULL),
+        on_complete = function(response_text) {
+          if (!is_current_request()) {
+            return()
+          }
+          sheet <- tryCatch(
+            parse_character_sheet(response_text),
+            error = function(error) error
+          )
+          if (inherits(sheet, "error")) {
+            character_sheet_status(paste(
+              "Não foi possível interpretar a ficha retornada pela LLM:",
+              conditionMessage(sheet)
+            ))
+          } else {
+            character_sheet(sheet)
+            character_sheet_status("Ficha atualizada com as memórias da campanha.")
+          }
+          character_sheet_cancel(NULL)
+          flush_sheet()
+        },
+        on_error = function(message) {
+          if (!is_current_request()) {
+            return()
+          }
+          character_sheet_status(paste(
+            "Não foi possível atualizar a ficha com a LLM:",
+            message
+          ))
+          character_sheet_cancel(NULL)
+          flush_sheet()
+        },
+        register_cancel = function(cancel) {
+          if (is_current_request()) {
+            character_sheet_cancel(cancel)
+          } else {
+            cancel()
+          }
+        },
+        is_cancelled = function() !is_current_request()
+      ),
+      error = function(error) {
+        if (is_current_request()) {
+          character_sheet_status(paste(
+            "Não foi possível atualizar a ficha com a LLM:",
+            conditionMessage(error)
+          ))
+          character_sheet_cancel(NULL)
+          flush_sheet()
+        }
+      }
+    )
+    invisible(NULL)
+  }
+
+  refresh_character_sheet_if_dirty <- function() {
+    if (!isTRUE(shiny::isolate(character_sheet_dirty()))) {
+      return(invisible(NULL))
+    }
+    character_sheet_dirty(FALSE)
+    character_sheet_revision(
+      shiny::isolate(character_sheet_revision()) + 1L
+    )
+    invisible(NULL)
+  }
+
+  observeEvent(character_sheet_revision(), {
+    refresh_character_sheet()
+  }, ignoreInit = FALSE)
 
   set_generation_running <- function(running) {
     generation_running(running)
@@ -1252,6 +1630,7 @@ server <- function(input, output, session) {
 
   observeEvent(input$cancelAction, {
     cancel_active_generation()
+    refresh_character_sheet_if_dirty()
   })
 
   start_streaming_generation <- function(
@@ -1381,6 +1760,16 @@ server <- function(input, output, session) {
     )
   })
 
+  observeEvent(input$showCharacterSheet, {
+    showModal(modalDialog(
+      title = tagList(icon("user"), "Ficha do personagem"),
+      uiOutput("characterSheet"),
+      size = "l",
+      easyClose = TRUE,
+      footer = modalButton("Fechar")
+    ))
+  })
+
   observeEvent(input$simulateCharacterAction, {
     cancel_active_generation(message = NULL, flush = FALSE)
     context_snapshot <- tryCatch(
@@ -1428,6 +1817,87 @@ server <- function(input, output, session) {
         status_message(paste("Não foi possível sugerir uma ação:", message))
       }
     )
+  })
+
+  observeEvent(input$addDmContext, {
+    new_context <- trimws(input$dmContext)
+    if (!nzchar(new_context)) {
+      status_message("Escreva uma informação nova antes de validar o contexto.")
+      return()
+    }
+
+    status_message("Validando a nova informação de contexto com o Jev...")
+    context_snapshot <- tryCatch(
+      retrieve_campaign_context(
+        campaign_store,
+        campaign_id,
+        paste("VALIDAÇÃO DE NOVO CONTEXTO:", new_context)
+      ),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível recuperar a memória vetorial da campanha:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(context_snapshot)) {
+      return()
+    }
+    campaign_context_snapshot(context_snapshot)
+
+    review <- tryCatch(
+      validate_dm_context_with_jev(new_context, context_snapshot),
+      error = function(error) {
+        status_message(paste(
+          "Não foi possível validar o novo contexto com o Jev:",
+          conditionMessage(error)
+        ))
+        NULL
+      }
+    )
+    if (is.null(review)) {
+      return()
+    }
+    if (!isTRUE(review$accepted)) {
+      reasons <- c(
+        if (identical(review$consistency$choice, "contradiction")) {
+          "a informação contradiz fatos já estabelecidos"
+        },
+        if (identical(
+          review$fundamental_plausibility$choice,
+          "fundamentally_absurd"
+        )) {
+          "a informação foi considerada absurda em nível fundamental"
+        }
+      )
+      status_message(paste0(
+        "Contexto não adicionado: ",
+        paste(reasons, collapse = " e "),
+        ". Revise a informação e tente novamente."
+      ))
+      return()
+    }
+
+    persisted <- persist_campaign_memory(
+      "dm_context",
+      paste("Informação de contexto do DM:", new_context),
+      list(
+        information = new_context,
+        validation = list(
+          consistency = review$consistency,
+          fundamental_plausibility = review$fundamental_plausibility
+        ),
+        context_used = context_snapshot
+      )
+    )
+    if (isTRUE(persisted$persisted)) {
+      updateTextAreaInput(session, "dmContext", value = "")
+    }
+    status_message(memory_status(
+      persisted,
+      "Contexto do DM validado e adicionado à memória da campanha."
+    ))
   })
 
   observeEvent(input$eventDescription, ignoreInit = TRUE, {
@@ -1593,13 +2063,16 @@ server <- function(input, output, session) {
     result$success <- result$sigma_band_index >= result$success_threshold_index
     result$outcome <- if (result$success) "SUCESSO" else "FALHA"
     action_result(result)
+    jev_result(NULL)
+    updateTextAreaInput(session, "eventDescription", value = "")
     narration(NULL)
     campaign_story_stream("")
     memory_entry <- action_campaign_memory(result)
     persisted <- persist_campaign_memory(
       "action",
       memory_entry$content,
-      memory_entry$metadata
+      memory_entry$metadata,
+      refresh_sheet = FALSE
     )
     if (!isTRUE(persisted$persisted)) {
       status_message(memory_status(
@@ -1637,9 +2110,11 @@ server <- function(input, output, session) {
           memory_id = result$memory_id
         )
         campaign_story_stream(NULL)
+        refresh_character_sheet_if_dirty()
         status_message(memory_status(persisted, "Ação e narração concluídas."))
       },
       on_error = function(message) {
+        refresh_character_sheet_if_dirty()
         status_message(memory_status(persisted, paste(
           "A ação foi calculada, mas a narração falhou:",
           message
@@ -1650,6 +2125,10 @@ server <- function(input, output, session) {
 
   session$onSessionEnded(function() {
     cancel_active_generation(message = NULL, flush = FALSE)
+    sheet_cancel <- shiny::isolate(character_sheet_cancel())
+    if (is.function(sheet_cancel)) {
+      sheet_cancel()
+    }
     if (DBI::dbIsValid(campaign_store)) {
       DBI::dbDisconnect(campaign_store)
     }
@@ -1667,24 +2146,129 @@ server <- function(input, output, session) {
 
   output$campaignStory <- renderUI({
     campaign_revision()
-    completed_narration <- campaign_narrations(campaign_store, campaign_id)
+    completed_entries <- campaign_story_entries(campaign_store, campaign_id)
     current_narration <- campaign_story_stream()
     show_current <- !is.null(current_narration) &&
       nzchar(current_narration) &&
-      (length(completed_narration) == 0L ||
-         !identical(tail(completed_narration, 1L), current_narration))
+      (length(completed_entries) == 0L ||
+         !identical(
+           tail(completed_entries, 1L)[[1]]$narration,
+           current_narration
+         ))
 
     tags$section(
       h2("Aventura até agora"),
       tags$div(
+        id = "campaign-story-scroll",
         style = paste(
           "max-height:320px;overflow-y:auto;padding:12px;",
           "border:1px solid #ddd;border-radius:4px;margin-bottom:16px;"
         ),
         tags$p(campaign_context_seed),
-        lapply(completed_narration, tags$p),
+        lapply(completed_entries, function(entry) {
+          tags$div(
+            style = "margin-bottom:12px;",
+            if (!is.null(entry$event) && nzchar(trimws(entry$event))) {
+              tags$p(
+                tags$strong("Ação do personagem: "),
+                entry$event
+              )
+            },
+            if (!is.null(entry$narration) &&
+                nzchar(trimws(entry$narration))) {
+              tags$p(
+                tags$strong(
+                  if (identical(entry$kind, "action")) {
+                    "O que aconteceu: "
+                  } else {
+                    "Continuação: "
+                  }
+                ),
+                entry$narration
+              )
+            }
+          )
+        }),
         if (show_current) tags$p(current_narration)
       )
+    )
+  })
+
+  output$characterSheet <- renderUI({
+    sheet <- character_sheet()
+    status <- character_sheet_status()
+    missing_value <- "Não registrado na base da campanha"
+    format_value <- function(value) {
+      if (is.null(value)) {
+        return(missing_value)
+      }
+      if (is.list(value)) {
+        value <- unlist(value, use.names = FALSE)
+        if (length(value) == 0L) {
+          return(missing_value)
+        }
+      }
+      paste(as.character(value), collapse = ", ")
+    }
+    sheet_field <- function(label, value) {
+      tags$div(
+        style = "margin-bottom:8px;",
+        tags$strong(paste0(label, ": ")),
+        format_value(value)
+      )
+    }
+    sheet_list <- function(label, values) {
+      items <- unlist(values %||% list(), use.names = FALSE)
+      tags$div(
+        style = "margin-bottom:8px;",
+        tags$strong(paste0(label, ": ")),
+        if (length(items) == 0L) {
+          missing_value
+        } else {
+          tags$ul(lapply(items, tags$li))
+        }
+      )
+    }
+    attributes <- if (is.null(sheet)) list() else sheet$attributes
+    attribute_labels <- c(
+      strength = "Força",
+      dexterity = "Destreza",
+      constitution = "Constituição",
+      intelligence = "Inteligência",
+      wisdom = "Sabedoria",
+      charisma = "Carisma"
+    )
+
+    tagList(
+      tags$p(status, class = "text-muted"),
+      if (is.null(sheet)) {
+        tags$p("A ficha será preenchida assim que a análise da LLM terminar.")
+      } else {
+        tagList(
+            sheet_field("Nome", sheet$name),
+            sheet_field("Classe", sheet$class),
+            sheet_field("Ancestralidade", sheet$ancestry),
+            sheet_field("Antecedentes", sheet$background),
+            sheet_field("Divindade", sheet$deity),
+            sheet_field("Nível", sheet$level),
+            sheet_field("Pontos de vida", sheet$hit_points),
+            tags$strong("Atributos"),
+            tags$ul(lapply(names(attribute_labels), function(attribute) {
+              tags$li(
+                paste0(attribute_labels[[attribute]], ": "),
+                format_value(attributes[[attribute]])
+              )
+            })),
+            sheet_list("Perícias", sheet$skills),
+            sheet_list("Habilidades", sheet$abilities),
+            sheet_list("Equipamento", sheet$equipment),
+            sheet_list("Companheiros", sheet$companions),
+            sheet_list("Outros fatos", sheet$other_facts),
+            tags$p(
+              "Os dados são gerados pela LLM a partir das memórias da campanha. O que não estiver estabelecido permanece como não registrado."
+            )
+        )
+      }
     )
   })
 
@@ -1874,7 +2458,7 @@ server <- function(input, output, session) {
       ) +
       scale_y_continuous(
         limits = c(0, 100),
-        breaks = seq(0, 100, by = 10),
+        breaks = seq(0, 100, by = 20),
         labels = function(value) paste0(value, "%"),
         expand = c(0, 0)
       ) +
@@ -1894,10 +2478,12 @@ server <- function(input, output, session) {
       theme(
         legend.position = "bottom",
         legend.title = element_text(face = "bold"),
-        legend.text = element_text(size = 8)
+        legend.text = element_text(size = 7),
+        legend.spacing.x = grid::unit(0.35, "cm"),
+        legend.box.spacing = grid::unit(0.15, "cm")
       ) +
       guides(fill = guide_legend(
-        ncol = 2,
+        ncol = 3,
         byrow = TRUE,
         override.aes = list(alpha = 0.7)
       ))
