@@ -83,6 +83,58 @@ sigma_adjectives <- c(
   "Inconcebível"
 )
 
+campaign_context_seed <- paste(
+  "Vocês são um pequeno grupo de aventureiros que acabou de chegar à vila de Pedra Clara, no fim de uma estrada cercada por mata.",
+  "Na estalagem, a dona, Mara, conta que uma caravana desapareceu na noite passada e pede ajuda para encontrar o mercador Raul e seus viajantes.",
+  "Lá fora, a chuva ameaça apagar os rastros da estrada.",
+  sep = "\n"
+)
+
+campaign_memory_limit <- 8L
+
+format_campaign_context <- function(memory) {
+  paste(
+    c(campaign_context_seed, unlist(memory, use.names = FALSE)),
+    collapse = "\n\n"
+  )
+}
+
+append_campaign_memory <- function(memory, event, narration_text) {
+  entry <- paste(
+    paste("Ação:", trimws(event)),
+    paste("O que aconteceu:", trimws(narration_text)),
+    sep = "\n"
+  )
+  utils::tail(c(memory, list(entry)), campaign_memory_limit)
+}
+
+format_jev_state <- function(event_description, campaign_context) {
+  paste(
+    "CONTEXTO DA AVENTURA — fatos já estabelecidos:",
+    campaign_context,
+    "",
+    "AÇÃO ATUAL — classifique esta ação levando em conta o contexto acima:",
+    event_description,
+    sep = "\n"
+  )
+}
+
+difficulty_success_band_index <- stats::setNames(
+  rev(seq_along(sigma_adjectives)),
+  names(difficulty_labels)
+)
+
+difficulty_success_thresholds <- stats::setNames(
+  vapply(
+    difficulty_success_band_index,
+    function(index) {
+      paste(sigma_adjectives[[index]], sigma_band_labels[[index]], sep = " — ")
+    },
+    character(1)
+  ),
+  names(difficulty_success_band_index)
+)
+
 sigma_adjective_for_score <- function(sigma_score) {
   if (length(sigma_score) != 1L || !is.numeric(sigma_score) ||
       !is.finite(sigma_score)) {
@@ -101,6 +153,18 @@ sigma_band_for_score <- function(sigma_score) {
 
   band_index <- findInterval(sigma_score, -5:5) + 1L
   sigma_band_labels[[band_index]]
+}
+
+format_result_number <- function(value) {
+  formatted <- sprintf("%.15f", value)
+  formatted <- sub("0+$", "", formatted)
+  formatted <- sub("\\.$", "", formatted)
+  if (formatted %in% c("-0", "")) "0" else formatted
+}
+
+format_signed_result_number <- function(value) {
+  formatted <- format_result_number(value)
+  if (value > 0) paste0("+", formatted) else formatted
 }
 
 truncated_normal_bounds <- function(mu, sigma) {
@@ -155,15 +219,17 @@ sample_action <- function(mu, sigma) {
 
   percentile <- stats::runif(1)
   roll <- d100_roll_for_percentile(percentile, mu, sigma)
-  sigma_score <- (roll - mu) / sigma
+  sigma_score <- stats::qnorm(percentile)
+  expected_sigma_delta <- (roll - mu) / sigma
 
   list(
     roll = roll,
     percentile = percentile,
+    is_typical = sigma_score >= -1 && sigma_score <= 1,
     expected_roll = mu,
     roll_delta = roll - mu,
+    expected_sigma_delta = expected_sigma_delta,
     sigma_score = sigma_score,
-    normal_percentile = stats::pnorm(sigma_score),
     sigma_band = sigma_band_for_score(sigma_score),
     sigma_adjective = sigma_adjective_for_score(sigma_score)
   )
@@ -201,7 +267,7 @@ parse_choice_answer <- function(answer, valid_options, answer_name) {
   )
 }
 
-classify_event_with_jev <- function(event_description) {
+classify_event_with_jev <- function(event_description, campaign_context) {
   api_key <- trimws(Sys.getenv("TYPESAFE_API_KEY", unset = ""))
   if (!nzchar(api_key)) {
     stop("Configure a variável de ambiente TYPESAFE_API_KEY para usar o Jev.",
@@ -247,7 +313,7 @@ classify_event_with_jev <- function(event_description) {
 
   request_body <- list(
     model = "jev-latest",
-    state = event_description,
+    state = format_jev_state(event_description, campaign_context),
     questions = list(
       difficulty = list(
         type = "choice",
@@ -303,40 +369,45 @@ classify_event_with_jev <- function(event_description) {
 
 action_narration_facts <- function(result) {
   paste(
-    "Fatos da ação:",
+    "CONTEXTO ANTERIOR DA AVENTURA — preserve a continuidade e não contradiga fatos estabelecidos:",
+    result$campaign_context,
     "",
-    paste("Evento:", result$event),
-    paste("Dificuldade:", result$difficulty),
-    paste("Rolagem esperada (μ):", format(round(result$expected_roll, 2), nsmall = 2)),
-    paste("Variância:", result$variance),
-    paste("Desvio padrão da variância (σ):", format(round(result$sigma, 2), nsmall = 2)),
-    paste("Valor rolado:", format(round(result$roll, 2), nsmall = 2)),
-    paste("Diferença em relação ao esperado:", format(round(result$roll_delta, 2), nsmall = 2)),
-    paste("Percentil acumulado do modelo d100:", format(round(result$percentile * 100, 2), nsmall = 2), "%"),
-    paste("Desvio padronizado em relação ao esperado:", format(round(result$sigma_score, 2), nsmall = 2), "σ"),
-    paste("Percentil normal de referência:", format(round(result$normal_percentile * 100, 2), nsmall = 2), "%"),
-    paste("Faixa sigma:", result$sigma_band, "—", result$sigma_adjective),
+    "AÇÃO ATUAL:",
+    result$event,
+    paste(
+      "Desfecho:",
+      if (result$success) {
+        "o personagem alcança o objetivo."
+      } else {
+        "o personagem não alcança o objetivo."
+      }
+    ),
     sep = "\n"
   )
 }
 
-narrate_action_with_ollama <- function(result) {
-  response <- httr2::request("http://127.0.0.1:11434/api/chat") |>
+narrate_action_with_ollama <- function(
+  result,
+  on_token,
+  on_complete,
+  on_error,
+  register_cancel,
+  is_cancelled
+) {
+  request <- httr2::request("http://127.0.0.1:11434/api/chat") |>
     httr2::req_body_json(list(
       model = "gemma4:latest",
       messages = list(
         list(
           role = "system",
           content = paste(
-            "Você é a narradora de um RPG de mesa.",
-            "Crie, em português brasileiro, uma narração concisa e envolvente baseada nos fatos fornecidos.",
-            "A rolagem esperada (μ) é o centro de referência: compare o valor rolado com μ e considere a diferença e o desvio padronizado (z = (rolagem − μ) / σ).",
-            "Uma diferença próxima de zero é um resultado comum para aquela ação; diferença negativa indica resultado abaixo do esperado, e positiva indica acima. Quanto maior o valor absoluto de z, mais incomum é o resultado. Use o adjetivo sigma correspondente para expressar essa intensidade.",
-            "O percentil acumulado do modelo d100 vem da curva suavizada; o percentil normal de referência e o z-score são apresentados separadamente. Use z-score e adjetivo para interpretar a distância em relação ao esperado, sem tratar o percentil suavizado como sigma.",
-            "A dificuldade descreve o desafio e a variância descreve a imprevisibilidade. Considere ambas ao narrar o efeito da rolagem: em uma ação difícil, um resultado perto da média continua sendo esperado para esse desafio; uma rolagem acima ou abaixo da média deve alterar proporcionalmente o tom ou o grau de progresso.",
-            "Calibração: com μ=70 e σ=10, uma rolagem 54,86 fica 15,14 abaixo do esperado (z≈−1,51σ, Incomum): narre uma complicação moderada, não uma catástrofe. Uma rolagem 77,45 fica 7,45 acima (z≈+0,75σ, Habitual): é um resultado favorável, mas ainda dentro do padrão comum. Uma rolagem 69,78 fica praticamente na média (z≈−0,02σ, Corriqueiro): narre o curso esperado da ação, sem exagerar sucesso ou revés.",
-            "Não imponha uma conclusão binária de sucesso ou fracasso. Narre o que aconteceu e o grau de progresso, complicação ou vantagem de forma proporcional ao evento e à posição do resultado em relação ao esperado.",
-            "Use explicitamente o adjetivo informado e não contradiga a descrição do evento nem os dados da rolagem."
+            "Você é o Mestre de Jogo e está narrando uma cena de RPG em andamento. Faça roleplay: fale como quem conduz a cena para os jogadores, não como alguém que avalia a ficha ou comenta uma jogada.",
+            "Use o contexto anterior como memória da aventura e as informações da ação atual somente como orientação interna. Continue a história a partir do que já aconteceu, mantenha personagens, lugares e fatos consistentes e não reinicie a aventura.",
+            "Responda com a cena acontecendo agora: descreva ações, gestos, expressões, sons, ambiente e consequências que os personagens percebem.",
+            "Não explique nem avalie a capacidade, o desempenho, a persuasão ou a convicção do personagem. Não dê notas, níveis, categorias ou rótulos à ação ou ao personagem.",
+            "Não mencione regras, jogo, rolagem, dados, resultados, atributos, perícias, dificuldade, sorte, probabilidade ou qualquer outra mecânica. Não escreva cabeçalhos nem anuncie SUCESSO ou FALHA: mostre o desfecho somente pelo que acontece na ficção.",
+            "Escreva em português brasileiro coloquial, como uma fala teatral e vívida do DM. Quando couber, interprete os personagens com falas curtas em discurso direto. Prefira duas ou três frases curtas e não invente detalhes que contradigam a situação.",
+            "Mantenha o desfecho indicado nas informações internas, mas não o nomeie nem o explique; narre apenas a consequência vivida pelos personagens."
           )
         ),
         list(
@@ -344,21 +415,101 @@ narrate_action_with_ollama <- function(result) {
           content = action_narration_facts(result)
         )
       ),
-      stream = FALSE
+      stream = TRUE
     )) |>
-    httr2::req_timeout(180) |>
-    httr2::req_perform()
-  httr2::resp_check_status(response)
-  body <- httr2::resp_body_json(response, simplifyVector = FALSE)
-  narration <- body$message$content
+    httr2::req_timeout(180)
+  response <- NULL
+  chunks <- character()
 
-  if (!is.character(narration) || length(narration) != 1L ||
-      is.na(narration) || !nzchar(trimws(narration))) {
-    stop("Ollama retornou uma narração vazia ou em formato inválido.",
-         call. = FALSE)
+  close_response <- function() {
+    if (!is.null(response)) {
+      close(response)
+      response <<- NULL
+    }
   }
 
-  narration
+  cancel <- function() {
+    cancelled <<- TRUE
+    close_response()
+  }
+  cancelled <- FALSE
+  register_cancel(cancel)
+
+  fail <- function(error) {
+    close_response()
+    if (!cancelled && !is_cancelled()) {
+      on_error(conditionMessage(error))
+    }
+  }
+
+  tryCatch({
+    if (cancelled || is_cancelled()) {
+      return(invisible(NULL))
+    }
+    response <- httr2::req_perform_connection(request, blocking = FALSE)
+    httr2::resp_check_status(response)
+  }, error = fail)
+
+  if (cancelled || is_cancelled() || is.null(response)) {
+    close_response()
+    return(invisible(NULL))
+  }
+
+  read_next <- function() {
+    if (cancelled || is_cancelled()) {
+      close_response()
+      return(invisible(NULL))
+    }
+
+    tryCatch({
+      lines <- httr2::resp_stream_lines(response, lines = 1)
+      if (length(lines) == 0L) {
+        if (httr2::resp_stream_is_complete(response)) {
+          stop("Ollama encerrou o streaming sem concluir a resposta.",
+               call. = FALSE)
+        }
+        later::later(read_next, delay = 0.02)
+        return(invisible(NULL))
+      }
+
+      line <- lines[[1]]
+      if (nzchar(trimws(line))) {
+        item <- jsonlite::fromJSON(line, simplifyVector = FALSE)
+        if (cancelled || is_cancelled()) {
+          close_response()
+          return(invisible(NULL))
+        }
+        if (!is.null(item$error)) {
+          stop(paste("Ollama retornou um erro:", item$error), call. = FALSE)
+        }
+
+        token <- item$message$content
+        if (is.character(token) && length(token) == 1L &&
+            !is.na(token) && nzchar(token)) {
+          chunks <<- c(chunks, token)
+          on_token(token)
+        }
+
+        if (isTRUE(item$done)) {
+          close_response()
+          if (cancelled || is_cancelled()) {
+            return(invisible(NULL))
+          }
+          if (!nzchar(trimws(paste0(chunks, collapse = "")))) {
+            stop("Ollama retornou uma narração vazia ou em formato inválido.",
+                 call. = FALSE)
+          }
+          on_complete()
+          return(invisible(NULL))
+        }
+      }
+
+      later::later(read_next, delay = 0.02)
+    }, error = fail)
+  }
+
+  later::later(read_next, delay = 0)
+  invisible(NULL)
 }
 
 ui <- fluidPage(
@@ -376,6 +527,7 @@ ui <- fluidPage(
   fluidRow(
     column(
       width = 4,
+      uiOutput("campaignStory"),
       h2("Descreva o evento"),
       textAreaInput(
         "eventDescription",
@@ -388,6 +540,7 @@ ui <- fluidPage(
       actionButton("analyzeEvent", "Analisar evento com Jev"),
       hr(),
       uiOutput("statusText"),
+      uiOutput("campaignContext"),
       uiOutput("jevSummary"),
       hr(),
       h3("Dificuldade e variância"),
@@ -417,7 +570,11 @@ ui <- fluidPage(
         min = 0.1,
         step = 0.1
       ),
-      actionButton("rollAction", "Rodar ação", class = "btn-primary"),
+      div(
+        style = "display:flex;gap:8px;",
+        actionButton("rollAction", "Rodar ação", class = "btn-primary"),
+        actionButton("cancelAction", "Cancelar", class = "btn-warning", disabled = TRUE)
+      ),
       hr()
     ),
     column(
@@ -425,10 +582,10 @@ ui <- fluidPage(
       h3("Distribuição dos resultados"),
       plotOutput("plotDistribution", height = "590px"),
       hr(),
-      h4("Resultado da ação"),
-      uiOutput("actionResult"),
       h4("Narração"),
-      uiOutput("narration")
+      uiOutput("narration"),
+      h4("Resultado da ação"),
+      uiOutput("actionResult")
     )
   )
 )
@@ -438,6 +595,45 @@ server <- function(input, output, session) {
   action_result <- reactiveVal(NULL)
   narration <- reactiveVal(NULL)
   status_message <- reactiveVal("Descreva o evento e peça uma análise ao Jev.")
+  generation_running <- reactiveVal(FALSE)
+  generation_id <- reactiveVal(0L)
+  active_generation <- reactiveVal(NULL)
+  active_cancel <- reactiveVal(NULL)
+  campaign_memory <- reactiveVal(list())
+  campaign_narrative <- reactiveVal(character())
+
+  set_generation_running <- function(running) {
+    generation_running(running)
+    updateActionButton(session, "cancelAction", disabled = !running)
+  }
+
+  cancel_active_generation <- function(
+    message = "Geração cancelada. O resultado da rolagem foi mantido.",
+    flush = TRUE
+  ) {
+    if (!isTRUE(shiny::isolate(generation_running()))) {
+      return(invisible(NULL))
+    }
+
+    cancel <- shiny::isolate(active_cancel())
+    active_generation(NULL)
+    active_cancel(NULL)
+    set_generation_running(FALSE)
+    if (is.function(cancel)) {
+      cancel()
+    }
+    if (!is.null(message)) {
+      status_message(message)
+    }
+    if (flush && !session$isClosed()) {
+      session$flushOutput()
+    }
+    invisible(NULL)
+  }
+
+  observeEvent(input$cancelAction, {
+    cancel_active_generation()
+  })
 
   observeEvent(input$eventDescription, ignoreInit = TRUE, {
     analysis <- jev_result()
@@ -462,8 +658,9 @@ server <- function(input, output, session) {
     }
 
     status_message("Consultando o Jev...")
+    context_snapshot <- format_campaign_context(campaign_memory())
     result <- tryCatch(
-      classify_event_with_jev(event),
+      classify_event_with_jev(event, context_snapshot),
       error = function(error) {
         status_message(paste("Não foi possível classificar o evento:", conditionMessage(error)))
         NULL
@@ -473,7 +670,11 @@ server <- function(input, output, session) {
       return()
     }
 
-    jev_result(list(event = event, classification = result))
+    jev_result(list(
+      event = event,
+      classification = result,
+      campaign_context = context_snapshot
+    ))
     updateSelectInput(session, "selectDifficulty", selected = result$difficulty$choice)
     updateNumericInput(
       session,
@@ -509,6 +710,7 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$rollAction, {
+    cancel_active_generation(message = NULL, flush = FALSE)
     analysis <- jev_result()
     if (is.null(analysis)) {
       status_message("Analise o evento com Jev antes de rodar a ação.")
@@ -533,35 +735,147 @@ server <- function(input, output, session) {
       event = analysis$event,
       difficulty = unname(difficulty_labels[[input$selectDifficulty]]),
       variance = unname(variance_labels[[input$selectVariance]]),
+      campaign_context = analysis$campaign_context,
       mu = mu,
       sigma = sigma,
       roll = action$roll,
+      success_threshold = unname(difficulty_success_thresholds[[input$selectDifficulty]]),
+      success_threshold_index = unname(difficulty_success_band_index[[input$selectDifficulty]]),
       percentile = action$percentile,
+      is_typical = action$is_typical,
       expected_roll = action$expected_roll,
       roll_delta = action$roll_delta,
+      expected_sigma_delta = action$expected_sigma_delta,
       sigma_score = action$sigma_score,
-      normal_percentile = action$normal_percentile,
+      sigma_band_index = match(action$sigma_adjective, sigma_adjectives),
       sigma_band = action$sigma_band,
       sigma_adjective = action$sigma_adjective
     )
+    result$success <- result$sigma_band_index >= result$success_threshold_index
+    result$outcome <- if (result$success) "SUCESSO" else "FALHA"
     action_result(result)
     narration(NULL)
-    status_message("Ação calculada. Gerando a narração local...")
+    status_message("Rolagem exibida no gráfico. Gerando a narração local...")
+    current_generation <- generation_id() + 1L
+    generation_id(current_generation)
+    active_generation(current_generation)
+    active_cancel(NULL)
+    set_generation_running(TRUE)
+    session$onFlushed(function() {
+      later::later(function() {
+        if (!identical(
+          shiny::isolate(active_generation()),
+          current_generation
+        )) {
+          return()
+        }
 
-    generated_narration <- tryCatch(
-      narrate_action_with_ollama(result),
-      error = function(error) {
-        status_message(paste("A ação foi calculada, mas a narração falhou:", conditionMessage(error)))
-        NULL
-      }
-    )
-    if (!is.null(generated_narration)) {
-      narration(generated_narration)
-      status_message("Ação e narração concluídas.")
-    }
+        narration_chunks <- character()
+        narrate_action_with_ollama(
+          result,
+          on_token = function(token) {
+            if (!identical(
+              shiny::isolate(active_generation()),
+              current_generation
+            )) {
+              return()
+            }
+            narration_chunks <<- c(narration_chunks, token)
+            narration(paste0(narration_chunks, collapse = ""))
+            session$flushOutput()
+          },
+          on_complete = function() {
+            if (!identical(
+              shiny::isolate(active_generation()),
+              current_generation
+            )) {
+              return()
+            }
+            active_generation(NULL)
+            active_cancel(NULL)
+            set_generation_running(FALSE)
+            campaign_memory(append_campaign_memory(
+              shiny::isolate(campaign_memory()),
+              result$event,
+              paste0(narration_chunks, collapse = "")
+            ))
+            campaign_narrative(utils::tail(
+              c(
+                shiny::isolate(campaign_narrative()),
+                paste0(narration_chunks, collapse = "")
+              ),
+              campaign_memory_limit
+            ))
+            status_message("Ação e narração concluídas.")
+            session$flushOutput()
+          },
+          on_error = function(message) {
+            if (!identical(
+              shiny::isolate(active_generation()),
+              current_generation
+            )) {
+              return()
+            }
+            active_generation(NULL)
+            active_cancel(NULL)
+            set_generation_running(FALSE)
+            status_message(paste(
+              "A ação foi calculada, mas a narração falhou:",
+              message
+            ))
+            session$flushOutput()
+          },
+          register_cancel = function(cancel) {
+            active_cancel(cancel)
+          },
+          is_cancelled = function() {
+            !identical(
+              shiny::isolate(active_generation()),
+              current_generation
+            )
+          }
+        )
+      }, delay = 0.05)
+    }, once = TRUE)
+  })
+
+  session$onSessionEnded(function() {
+    cancel_active_generation(message = NULL, flush = FALSE)
   })
 
   output$statusText <- renderUI(tags$p(status_message()))
+
+  output$campaignStory <- renderUI({
+    completed_narration <- campaign_narrative()
+    current_narration <- narration()
+    show_current <- !is.null(current_narration) &&
+      nzchar(current_narration) &&
+      (length(completed_narration) == 0L ||
+         !identical(tail(completed_narration, 1L), current_narration))
+
+    tags$section(
+      h2("Aventura até agora"),
+      tags$div(
+        style = paste(
+          "max-height:320px;overflow-y:auto;padding:12px;",
+          "border:1px solid #ddd;border-radius:4px;margin-bottom:16px;"
+        ),
+        tags$p(campaign_context_seed),
+        lapply(completed_narration, tags$p),
+        if (show_current) tags$p(current_narration)
+      )
+    )
+  })
+
+  output$campaignContext <- renderUI({
+    tags$details(
+      tags$summary("Contexto da aventura"),
+      tags$pre(
+        format_campaign_context(campaign_memory()),
+        style = "white-space:pre-wrap;"
+      )
+    )
+  })
 
   output$jevSummary <- renderUI({
     analysis <- jev_result()
@@ -580,8 +894,8 @@ server <- function(input, output, session) {
       )
     }
 
-    tagList(
-      h4("Sugestão do Jev"),
+    tags$details(
+      tags$summary("Sugestão do Jev"),
       p(sprintf(
         "Dificuldade: %s (confiança %.0f%%; %s)",
         difficulty_labels[[classification$difficulty$choice]],
@@ -603,28 +917,61 @@ server <- function(input, output, session) {
       return(tags$pre("Nenhuma ação rodada."))
     }
 
-    tags$pre(sprintf(
-      paste(
-        "Rolagem: %.2f",
-        "Esperado (μ): %.2f | Diferença: %+.2f",
-        "Percentil acumulado do modelo d100: %.2f%%",
-        "Desvio padronizado: %+.2fσ | Percentil normal de referência: %.2f%%",
-        "Faixa sigma: %s — %s",
-        sep = "\n"
+    tags$div(
+      tags$h3(
+        result$outcome,
+        style = paste0(
+          "color:",
+          if (result$success) "#237a3b" else "#b42318",
+          ";font-weight:bold;"
+        )
       ),
-      result$roll,
-      result$expected_roll,
-      result$roll_delta,
-      result$percentile * 100,
-      result$sigma_score,
-      result$normal_percentile * 100,
-      result$sigma_band,
-      result$sigma_adjective
-    ))
+      tags$pre(paste(
+        paste("Rolagem:", format_result_number(result$roll)),
+        paste(
+          "Esperado (μ):", format_result_number(result$expected_roll),
+          "| Diferença:", format_signed_result_number(result$roll_delta)
+        ),
+        paste(
+          "Percentil acumulado da curva d100:",
+          paste0(format_result_number(result$percentile * 100), "%")
+        ),
+        paste(
+          "Na faixa central típica de 68,27% da distribuição:",
+          if (result$is_typical) "Sim" else "Não"
+        ),
+        paste(
+          "Distância do centro esperado em unidades de σ:",
+          paste0(format_signed_result_number(result$expected_sigma_delta), "σ")
+        ),
+        paste(
+          "Desvio normal-equivalente da raridade:",
+          paste0(format_signed_result_number(result$sigma_score), "σ")
+        ),
+        paste("Índice da faixa observada:", result$sigma_band_index, "de 12"),
+        paste("Faixa mínima de sucesso:", result$success_threshold),
+        paste("Índice mínimo para sucesso:", result$success_threshold_index, "de 12"),
+        paste("Faixa sigma:", result$sigma_band, "—", result$sigma_adjective),
+        sep = "\n"
+      ))
+    )
   })
 
   output$narration <- renderUI({
-    tags$p(narration() %||% "A narração aparece após a rolagem.")
+    current_narration <- narration()
+    if (!is.null(current_narration)) {
+      return(tags$p(current_narration))
+    }
+
+    if (is.null(action_result())) {
+      return(tags$p("A resposta do DM aparece após a rolagem."))
+    }
+
+    if (isTRUE(generation_running())) {
+      return(tags$p("Gerando Resposta do DM..."))
+    }
+
+    tags$p("Resposta do DM indisponível.")
   })
 
   output$plotDistribution <- renderPlot({
@@ -644,11 +991,11 @@ server <- function(input, output, session) {
     )
     sigma_rolls <- c(
       0,
-      pmin(pmax(mu + sigma * (-5:5), 0), 100),
+      d100_roll_for_percentile(stats::pnorm(-5:5), mu, sigma),
       100
     )
     sigma_colors <- stats::setNames(
-      grDevices::hcl.colors(length(sigma_band_labels), "RdYlBu", rev = TRUE),
+      grDevices::hcl.colors(length(sigma_band_labels), "RdYlBu"),
       sigma_band_labels
     )
     sigma_regions <- data.frame(
@@ -681,7 +1028,7 @@ server <- function(input, output, session) {
         expand = c(0, 0)
       ) +
       scale_fill_manual(
-        name = "Faixas de z em relação a μ (percentil normal de referência)",
+        name = NULL,
         values = sigma_colors,
         breaks = sigma_band_labels,
         labels = paste(sigma_adjectives, sigma_band_labels, sep = " — "),
@@ -703,6 +1050,17 @@ server <- function(input, output, session) {
         byrow = TRUE,
         override.aes = list(alpha = 0.7)
       ))
+
+    success_threshold_index <- difficulty_success_band_index[[input$selectDifficulty]]
+    if (!is.null(success_threshold_index)) {
+      plot <- plot +
+        geom_vline(
+          xintercept = sigma_rolls[[success_threshold_index]],
+          colour = "#292929",
+          linetype = "dashed",
+          linewidth = 0.9
+        )
+    }
 
     if (!is.null(result)) {
       plot <- plot +
